@@ -1,0 +1,292 @@
+{
+  "feature_cols": [
+    "atr",
+    "atr_norm",
+    "spread_over_atr",
+    "ema_spread",
+    "ema_fast_slope",
+    "ema_slow_slope",
+    "rsi_c",
+    "macd_hist_norm",
+    "stoch_k_c",
+    "vol_rel",
+    "range_over_atr",
+    "body_over_atr",
+    "uw_over_atr",
+    "lw_over_atr"
+  ],
+  "regimes": [
+    "trend",
+    "range",
+    "highvol"
+  ],
+  "folds": [
+    {
+      "fold": 1,
+      "detector_thresholds": {
+        "th_highvol": 0.000689620985486469,
+        "th_atr_lo": 0.00039169421197729763,
+        "th_spread_hi": 0.540179282343729,
+        "th_spread_lo": -0.31409053057882375,
+        "th_slope_hi": 0.45044404219436274,
+        "th_slope_lo": 0.1591291183285648
+      },
+      "regimes": {
+        "trend": {
+          "best_window_reward": 1124874999999.5972,
+          "val_metrics": {
+            "trades": 57,
+            "balance": 15.613999999992302,
+            "winrate": 0.5614035087719298,
+            "profit_factor": 1.2361071207147971,
+            "avg_pnl": 0.27392982456126846,
+            "max_drawdown": 25.787000000007083
+          },
+          "val_score": 0.20321795404812457
+        },
+        "range": {
+          "best_window_reward": 860749999999.3816,
+          "val_metrics": {
+            "trades": 49,
+            "balance": -21.575000000012096,
+            "winrate": 0.3469387755102041,
+            "profit_factor": 0.5428056791691143,
+            "avg_pnl": -0.44030612244922646,
+            "max_drawdown": 27.62600000000748
+          },
+          "val_score": -0.4900159874975586
+        },
+        "highvol": {
+          "best_window_reward": 4781249999999.1,
+          "val_metrics": {
+            "trades": 316,
+            "balance": -64.99100000001772,
+            "winrate": 0.47468354430379744,
+            "profit_factor": 0.8994316326672449,
+            "avg_pnl": -0.20566772151904342,
+            "max_drawdown": 135.27399999999489
+          },
+          "val_score": -0.27649670066608417
+        }
+      }
+    },
+    {
+      "fold": 2,
+      "detector_thresholds": {
+        "th_highvol": 0.0007134828249427731,
+        "th_atr_lo": 0.0004234671576838552,
+        "th_spread_hi": 0.5436470232175454,
+        "th_spread_lo": -0.38091379046707063,
+        "th_slope_hi": 0.4826196416803441,
+        "th_slope_lo": 0.16768646133673423
+      },
+      "regimes": {
+        "trend": {
+          "best_window_reward": 686374999999.9083,
+          "val_metrics": {
+            "trades": 10,
+            "balance": -15.301000000004933,
+            "winrate": 0.2,
+            "profit_factor": 0.23924824740206888,
+            "avg_pnl": -1.5301000000004934,
+            "max_drawdown": 18.11800000000403
+          },
+          "val_score": -0.7778500859312678
+        },
+        "range": {
+          "best_window_reward": 1739124999999.2708,
+          "val_metrics": {
+            "trades": 19,
+            "balance": -11.190000000008695,
+            "winrate": 0.3684210526315789,
+            "profit_factor": 0.524558123725095,
+            "avg_pnl": -0.5889473684215103,
+            "max_drawdown": 15.630000000006476
+          },
+          "val_score": -0.4922668762749104
+        },
+        "highvol": {
+          "best_window_reward": 265624999999.7862,
+          "val_metrics": {
+            "trades": 118,
+            "balance": -75.11100000005081,
+            "winrate": 0.4830508474576271,
+            "profit_factor": 0.7364137872948138,
+            "avg_pnl": -0.6365338983055153,
+            "max_drawdown": 91.85200000002897
+          },
+          "val_score": -0.36372954603854374
+        }
+      }
+    },
+    {
+      "fold": 3,
+      "detector_thresholds": {
+        "th_highvol": 0.0006695525677730676,
+        "th_atr_lo": 0.00036985641055032833,
+        "th_spread_hi": 0.47043488439562675,
+        "th_spread_lo": -0.3290090271604641,
+        "th_slope_hi": 0.43501211191278344,
+        "th_slope_lo": 0.1480121461733688
+      },
+      "regimes": {
+        "trend": {
+          "best_window_reward": 2244374999998.8765,
+          "val_metrics": {
+            "trades": 6,
+            "balance": 2.7999999999974534,
+            "winrate": 0.5,
+            "profit_factor": 1.4479999999992306,
+            "avg_pnl": 0.46666666666624224,
+            "max_drawdown": 3.8420000000014625
+          },
+          "val_score": 0.4435983333325627
+        },
+        "range": {
+          "best_window_reward": 1727624999999.1138,
+          "val_metrics": {
+            "trades": 14,
+            "balance": -4.2130000000061045,
+            "winrate": 0.35714285714285715,
+            "profit_factor": 0.6409272990705381,
+            "avg_pnl": -0.3009285714290075,
+            "max_drawdown": 7.08900000000358
+          },
+          "val_score": -0.3677802009294649
+        },
+        "highvol": {
+          "best_window_reward": -0.12253470526001148,
+          "val_metrics": {
+            "trades": 309,
+            "balance": -152.09500000012213,
+            "winrate": 0.44336569579288027,
+            "profit_factor": 0.7949489175480026,
+            "avg_pnl": -0.49221682847935966,
+            "max_drawdown": 180.21000000010918
+          },
+          "val_score": -0.41702608245208844
+        }
+      }
+    },
+    {
+      "fold": 4,
+      "detector_thresholds": {
+        "th_highvol": 0.0006541778419036373,
+        "th_atr_lo": 0.0003534289865753323,
+        "th_spread_hi": 0.4838201760288257,
+        "th_spread_lo": -0.2903915853477884,
+        "th_slope_hi": 0.4265623905121174,
+        "th_slope_lo": 0.14470835846116187
+      },
+      "regimes": {
+        "trend": {
+          "best_window_reward": 3121500000000.0234,
+          "val_metrics": {
+            "trades": 60,
+            "balance": -12.147000000022672,
+            "winrate": 0.4166666666666667,
+            "profit_factor": 0.86111047588532,
+            "avg_pnl": -0.20245000000037786,
+            "max_drawdown": 28.67700000001514
+          },
+          "val_score": -0.17478702411469266
+        },
+        "range": {
+          "best_window_reward": 704249999999.3013,
+          "val_metrics": {
+            "trades": 125,
+            "balance": 0.35099999994508835,
+            "winrate": 0.512,
+            "profit_factor": 1.003475453986811,
+            "avg_pnl": 0.0028079999995607066,
+            "max_drawdown": 15.440000000013242
+          },
+          "val_score": -0.03439121267986678
+        },
+        "highvol": {
+          "best_window_reward": 0.24169294229478552,
+          "val_metrics": {
+            "trades": 264,
+            "balance": -66.63800000009542,
+            "winrate": 0.5378787878787878,
+            "profit_factor": 0.892632437126556,
+            "avg_pnl": -0.2524166666670281,
+            "max_drawdown": 155.81000000005042
+          },
+          "val_score": -0.2900092295401526
+        }
+      }
+    },
+    {
+      "fold": 5,
+      "detector_thresholds": {
+        "th_highvol": 0.0006589802415258077,
+        "th_atr_lo": 0.000360943342235122,
+        "th_spread_hi": 0.49609273069959264,
+        "th_spread_lo": -0.3109887290634107,
+        "th_slope_hi": 0.4395809933005239,
+        "th_slope_lo": 0.1490989633371555
+      },
+      "regimes": {
+        "trend": {
+          "best_window_reward": 1053249999999.3801,
+          "val_metrics": {
+            "trades": 77,
+            "balance": -73.00600000002578,
+            "winrate": 0.33766233766233766,
+            "profit_factor": 0.4939767387054016,
+            "avg_pnl": -0.9481298701302049,
+            "max_drawdown": 73.44600000002356
+          },
+          "val_score": -0.582628261294618
+        },
+        "range": {
+          "best_window_reward": 1212124999999.51,
+          "val_metrics": {
+            "trades": 111,
+            "balance": -12.730000000049586,
+            "winrate": 0.4594594594594595,
+            "profit_factor": 0.8750466243934218,
+            "avg_pnl": -0.1146846846851314,
+            "max_drawdown": 29.789000000012493
+          },
+          "val_score": -0.17197754227325524
+        },
+        "highvol": {
+          "best_window_reward": 0.6057701151300977,
+          "val_metrics": {
+            "trades": 793,
+            "balance": -239.40200000032473,
+            "winrate": 0.49936948297604034,
+            "profit_factor": 0.8827856439561393,
+            "avg_pnl": -0.3018940731403843,
+            "max_drawdown": 302.49700000025314
+          },
+          "val_score": -0.527895189377405
+        }
+      }
+    }
+  ],
+  "best_val_score_by_regime": {
+    "trend": 0.4435983333325627,
+    "range": -0.03439121267986678,
+    "highvol": -0.27649670066608417
+  },
+  "hold_metrics": {
+    "trades": 1537,
+    "balance": -549.7110000004604,
+    "winrate": 0.47885491216655823,
+    "profit_factor": 0.9218904547270758,
+    "avg_pnl": -0.35765191932365675,
+    "max_drawdown": 796.8580000003967
+  },
+  "hold_score": -1.0495578786065882,
+  "final_detector_thresholds": {
+    "th_highvol": 0.0006761563446336099,
+    "th_atr_lo": 0.0003640955769609744,
+    "th_spread_hi": 0.5357488269710984,
+    "th_spread_lo": -0.3096428504029519,
+    "th_slope_hi": 0.4591338900293067,
+    "th_slope_lo": 0.1544202396944911
+  }
+}

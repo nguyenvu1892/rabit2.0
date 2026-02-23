@@ -1,0 +1,109 @@
+{
+  "folds": [
+    {
+      "fold": 1,
+      "train_len": 14166,
+      "val_len": 14166,
+      "best_window_reward": -0.24363304910713085,
+      "val_metrics": {
+        "trades": 2526,
+        "balance": -478.98600000033457,
+        "winrate": 0.49406175771971494,
+        "profit_factor": 0.8713769327254002,
+        "avg_pnl": -0.18962232779110633,
+        "max_drawdown": 491.5130000001518
+      },
+      "val_score": -1.043417233941393
+    },
+    {
+      "fold": 2,
+      "train_len": 28332,
+      "val_len": 14166,
+      "best_window_reward": -0.1734787501241443,
+      "val_metrics": {
+        "trades": 1977,
+        "balance": -624.028000000777,
+        "winrate": 0.4552352048558422,
+        "profit_factor": 0.7405392549816422,
+        "avg_pnl": -0.3156439049068169,
+        "max_drawdown": 658.3510000006427
+      },
+      "val_score": -1.2034865783522268
+    },
+    {
+      "fold": 3,
+      "train_len": 42498,
+      "val_len": 14166,
+      "best_window_reward": -0.1694968253951037,
+      "val_metrics": {
+        "trades": 1957,
+        "balance": -153.16800000077728,
+        "winrate": 0.515074092999489,
+        "profit_factor": 0.9396882111098641,
+        "avg_pnl": -0.07826673479855763,
+        "max_drawdown": 291.39500000058433
+      },
+      "val_score": -0.6945409555572895
+    },
+    {
+      "fold": 4,
+      "train_len": 56664,
+      "val_len": 14166,
+      "best_window_reward": -0.17687542417094645,
+      "val_metrics": {
+        "trades": 2320,
+        "balance": -585.9100000009093,
+        "winrate": 0.49267241379310345,
+        "profit_factor": 0.8329047413573144,
+        "avg_pnl": -0.25254741379349543,
+        "max_drawdown": 604.6750000007687
+      },
+      "val_score": -1.1349910919766595
+    },
+    {
+      "fold": 5,
+      "train_len": 70830,
+      "val_len": 14166,
+      "best_window_reward": -0.24564379349340604,
+      "val_metrics": {
+        "trades": 2761,
+        "balance": -702.2560000011208,
+        "winrate": 0.47917421224194134,
+        "profit_factor": 0.8481469764691918,
+        "avg_pnl": -0.25434842448428857,
+        "max_drawdown": 732.0220000010913
+      },
+      "val_score": -1.314071356865051
+    }
+  ],
+  "feature_cols": [
+    "atr",
+    "atr_norm",
+    "spread_over_atr",
+    "ema_spread",
+    "ema_fast_slope",
+    "ema_slow_slope",
+    "rsi_c",
+    "macd_hist_norm",
+    "stoch_k_c",
+    "vol_rel",
+    "range_over_atr",
+    "body_over_atr",
+    "uw_over_atr",
+    "lw_over_atr"
+  ],
+  "policy": {
+    "type": "MLP",
+    "hidden_size": 16
+  },
+  "best_val_score_global": -0.6945409555572895,
+  "hold_metrics": {
+    "trades": 2568,
+    "balance": -1551.9570000008644,
+    "winrate": 0.5097352024922118,
+    "profit_factor": 0.8726112615913368,
+    "avg_pnl": -0.6043446261685609,
+    "max_drawdown": 1708.502000000789
+  },
+  "hold_score": -2.0647404050759874
+}

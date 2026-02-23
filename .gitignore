@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Data / outputs (tuỳ bạn muốn giữ hay không)
+data/*.npy
+data/*.npz
+data/*.json
+data/reports/
+*.log
