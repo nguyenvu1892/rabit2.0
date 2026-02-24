@@ -15,6 +15,8 @@ from rabit.rl.policy_linear import LinearPolicy
 from rabit.regime.regime_detector import RegimeDetector
 from rabit.rl.regime_policy_bank import RegimePolicyBank
 
+from rabit.env.execution_model import ExecutionModel, ExecutionConfig
+from rabit.env.session_filter import SessionFilter, SessionConfig
 
 def _ensure_reports_dir():
     os.makedirs("data/reports", exist_ok=True)
@@ -176,7 +178,22 @@ def main():
     )
 
     # ===== Run TradingEnv as a streaming sim =====
-    env = TradingEnv(df_env, **env_cfg)
+    exec_model = ExecutionModel(ExecutionConfig(
+    slip_base=0.0,
+    slip_k_spread=0.10,
+    slip_k_atr=0.02,
+    slip_noise_std=0.02,
+    commission_per_side=0.0,
+    ))
+
+    sess = SessionFilter(SessionConfig())
+
+    env = TradingEnv(
+        df_env,
+        execution_model=exec_model,
+        session_filter=sess,
+        **env_cfg
+    )
 
     idx = {"i": 0}
 
