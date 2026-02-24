@@ -13,6 +13,7 @@ from rabit.env.metrics import compute_metrics, metrics_to_dict
 from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
+from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState, load_json, save_json
 
 from rabit.regime.regime_detector import RegimeDetector
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -159,6 +160,22 @@ def main():
     spread_hard_cap = 200         # keep your old spread_open_cap
     spread_spike_cap = 300        # additional fail-safe (if spread >= this => no entry)
 
+    # Meta-risk guardrails
+    meta_enabled = int(os.getenv("META_RISK", "1")) != 0
+    meta_state = None
+    meta_state_path = "data/reports/meta_risk_state.json"
+    meta_state_out = "data/reports/meta_risk_state.json"
+    if meta_enabled:
+        meta_cfg = MetaRiskConfig(
+            daily_dd_limit=daily_dd_limit,
+            loss_streak_limit=max_loss_streak,
+        )
+        meta_state = MetaRiskState(meta_cfg)
+        loaded = load_json(meta_state_path)
+        if loaded is not None:
+            meta_state = loaded
+            meta_state.cfg = meta_cfg
+
     # Env config
     env_cfg = dict(
         gap_close_minutes=60,
@@ -287,6 +304,8 @@ def main():
         day_min = global_balance
 
         trades_before = count_closed_trades(env.ledger)
+        if meta_state is not None:
+            meta_state.update_daily_equity(float(global_balance), str(day))
 
         # run day
         for i in range(day_start_i, day_end_i + 1):
@@ -318,11 +337,12 @@ def main():
                 # model decision
                 if mode == "linear":
                     dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i])
+                    regime = "na"
                 else:
-                    r = "mixed"
+                    regime = "mixed"
                     if regime_arr is not None:
-                        r = str(regime_arr[i])
-                    dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i], r)
+                        regime = str(regime_arr[i])
+                    dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i], regime)
 
                 if dir_ != 0:
                     # confidence -> size
@@ -340,12 +360,17 @@ def main():
                     vol_scale = float(np.clip(vol_scale, min_vol_scale, max_vol_scale))
 
                     final_size = base_size * vol_scale
+                    if meta_state is not None:
+                        final_size = meta_state.apply_guardrails(regime, float(final_size))
 
                     if final_size > 1e-6:
                         action = (dir_, float(tp_mult), float(sl_mult), int(hold_max), float(final_size))
 
             # step env
             env.step(i, action)
+
+            # equity snapshot after step
+            bal_after = get_balance(env.ledger) + global_balance
 
             # after step, check if a trade closed and update loss streak
             trades_after = count_closed_trades(env.ledger)
@@ -356,10 +381,12 @@ def main():
                         loss_streak += 1
                     else:
                         loss_streak = 0
+                    if meta_state is not None:
+                        regime_trade = str(regime_arr[i]) if regime_arr is not None else "na"
+                        meta_state.update_trade(regime_trade, float(pnl), date=str(ts))
+                        meta_state.update_daily_equity(float(bal_after), str(ts))
                 trades_before = trades_after
 
-            # equity snapshot after step
-            bal_after = get_balance(env.ledger) + global_balance
             equity_rows.append({
                 "day": str(day),
                 "ts": str(ts),
@@ -406,6 +433,8 @@ def main():
 
         # roll global balance (carry PnL forward)
         global_balance = bal_end
+        if meta_state is not None:
+            save_json(meta_state_out, meta_state)
 
     # ======================
     # FINAL REPORTS

@@ -5,7 +5,7 @@ import math
 import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
-
+import datetime
 
 @dataclass(init=False)
 class MetaRiskConfig:
@@ -15,6 +15,10 @@ class MetaRiskConfig:
     min_scale: float
     max_scale: float
     k: float
+    daily_dd_limit: float
+    loss_streak_limit: int
+    freeze_days: int
+    global_floor: float
 
     def __init__(
         self,
@@ -24,6 +28,10 @@ class MetaRiskConfig:
         min_scale: float = 0.25,
         max_scale: float = 1.25,
         k: float = 1.0,
+        daily_dd_limit: float = 3.0,
+        loss_streak_limit: int = 5,
+        freeze_days: int = 3,
+        global_floor: float = 0.2,
         alpha: Optional[float] = None,
         floor: Optional[float] = None,
         cap: Optional[float] = None,
@@ -41,6 +49,10 @@ class MetaRiskConfig:
         self.min_scale = float(min_scale)
         self.max_scale = float(max_scale)
         self.k = float(k)
+        self.daily_dd_limit = float(daily_dd_limit)
+        self.loss_streak_limit = int(loss_streak_limit)
+        self.freeze_days = int(freeze_days)
+        self.global_floor = float(global_floor)
 
     @property
     def alpha(self) -> float:
@@ -83,6 +95,10 @@ def _normalize_cfg_kwargs(cfg_data: Dict[str, Any]) -> Dict[str, Any]:
         "min_scale",
         "max_scale",
         "k",
+        "daily_dd_limit",
+        "loss_streak_limit",
+        "freeze_days",
+        "global_floor",
         "alpha",
         "floor",
         "cap",
@@ -90,10 +106,48 @@ def _normalize_cfg_kwargs(cfg_data: Dict[str, Any]) -> Dict[str, Any]:
     return {k: cfg[k] for k in allowed if k in cfg}
 
 
+def _extract_date_key(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        try:
+            return value.date().isoformat()
+        except Exception:
+            return None
+    s = value.strip()
+    if not s:
+        return None
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    for sep in ("T", " "):
+        if sep in s:
+            part = s.split(sep)[0]
+            if len(part) >= 10 and part[4] == "-" and part[7] == "-":
+                return part[:10]
+    try:
+        return datetime.fromisoformat(s.replace("Z", "")).date().isoformat()
+    except Exception:
+        return None
+
+
+def _date_ordinal(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10]).toordinal()
+    except Exception:
+        return None
+
+
 class MetaRiskState:
     def __init__(self, cfg: MetaRiskConfig) -> None:
         self.cfg = cfg
         self.regimes: Dict[str, RegimeStats] = {}
+        self.daily_equity_peak = 0.0
+        self.daily_drawdown = 0.0
+        self.loss_streak = 0
+        self.regime_freeze_until: Dict[str, str] = {}
+        self.daily_date: Optional[str] = None
 
     def update_trade(
         self,
@@ -120,6 +174,85 @@ class MetaRiskState:
         stats.n_trades += 1
         stats.last_update_ts = ts
 
+        date_key = _extract_date_key(ts or date)
+        if date_key is not None:
+            self.daily_date = date_key
+
+        if pnl_return > 0.0:
+            self.loss_streak = 0
+        else:
+            self.loss_streak += 1
+            if (
+                self.cfg.loss_streak_limit > 0
+                and self.loss_streak >= self.cfg.loss_streak_limit
+                and regime
+                and date_key is not None
+                and self.cfg.freeze_days > 0
+            ):
+                if isinstance(date_key, str):
+                    try:
+                        dt = datetime.date.fromisoformat(date_key[:10])
+                    except Exception:
+                        dt = datetime.datetime.utcnow().date()
+                else:
+                    dt = datetime.datetime.utcnow().date()
+
+            dt = None
+
+            if isinstance(date_key, str) and len(date_key) >= 10:
+                try:
+                    dt = datetime.date.fromisoformat(date_key[:10])
+                except Exception:
+                    dt = None
+
+            if dt is None:
+                dt = datetime.datetime.utcnow().date()
+
+            freeze_until = dt + datetime.timedelta(days=self.cfg.freeze_days)
+            self.regime_freeze_until[regime] = freeze_until.isoformat()
+
+    def update_daily_equity(self, equity: float, date: str) -> None:
+        equity = float(equity)
+        date_key = _extract_date_key(date)
+        if date_key is not None and self.daily_date != date_key:
+            self.daily_date = date_key
+            self.daily_equity_peak = equity
+            self.daily_drawdown = 0.0
+        if self.daily_equity_peak == 0.0 and self.daily_drawdown == 0.0:
+            self.daily_equity_peak = equity
+        self.daily_equity_peak = max(self.daily_equity_peak, equity)
+        dd_now = self.daily_equity_peak - equity
+        if dd_now > self.daily_drawdown:
+            self.daily_drawdown = dd_now
+
+    def _is_regime_frozen(self, regime: str) -> bool:
+        if not regime:
+            return False
+        until = self.regime_freeze_until.get(regime)
+        if not until:
+            return False
+        current = self.daily_date
+        cur_ord = _date_ordinal(current)
+        until_ord = _date_ordinal(until)
+        if cur_ord is None or until_ord is None:
+            return False
+        if cur_ord <= until_ord:
+            return True
+        self.regime_freeze_until.pop(regime, None)
+        return False
+
+    def apply_guardrails(self, regime: str, size: float) -> float:
+        size = float(size)
+        if size <= 0.0:
+            return 0.0
+        if self.daily_drawdown > self.cfg.daily_dd_limit:
+            return 0.0
+        if self.cfg.loss_streak_limit > 0 and self.loss_streak >= self.cfg.loss_streak_limit:
+            size *= 0.5
+        if self._is_regime_frozen(regime):
+            return 0.0
+        return float(max(0.0, min(1.0, size)))
+
     def meta_scale(self, regime: str) -> float:
         stats = self.regimes.get(regime)
         if stats is None:
@@ -137,6 +270,11 @@ class MetaRiskState:
         return {
             "config": asdict(self.cfg),
             "regimes": {key: asdict(stats) for key, stats in self.regimes.items()},
+            "daily_equity_peak": float(self.daily_equity_peak),
+            "daily_drawdown": float(self.daily_drawdown),
+            "loss_streak": int(self.loss_streak),
+            "regime_freeze_until": dict(self.regime_freeze_until),
+            "daily_date": self.daily_date,
         }
 
     @classmethod
@@ -163,6 +301,16 @@ class MetaRiskState:
                 else:
                     filtered = {}
                 state.regimes[str(key)] = RegimeStats(**filtered)
+
+        state.daily_equity_peak = float(data.get("daily_equity_peak", 0.0) or 0.0)
+        state.daily_drawdown = float(data.get("daily_drawdown", 0.0) or 0.0)
+        state.loss_streak = int(data.get("loss_streak", 0) or 0)
+        freeze = data.get("regime_freeze_until", {})
+        if isinstance(freeze, dict):
+            state.regime_freeze_until = {str(k): str(v) for k, v in freeze.items()}
+        else:
+            state.regime_freeze_until = {}
+        state.daily_date = data.get("daily_date")
         return state
 
     def save(self, path: str) -> None:

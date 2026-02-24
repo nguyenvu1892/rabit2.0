@@ -16,6 +16,7 @@ from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
 from rabit.rl.regime_policy_bank import RegimePolicyBank
+from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState, load_json, save_json
 from rabit.regime.regime_detector import RegimeDetector
 
 from rabit.env.execution_model import ExecutionModel, ExecutionConfig
@@ -53,6 +54,9 @@ class PaperLiveConfig:
     out_jsonl: str = "paper_live_log.jsonl"
     out_state: str = "paper_live_state.json"
     out_orders: str = "paper_live_orders.csv"
+    meta_risk_enabled: bool = True
+    meta_risk_state: str = "meta_risk_state.json"
+    meta_risk_save_every: int = 50
 
     # Execution realism (for paper fill estimate)
     slip_k_spread: float = 0.10
@@ -261,6 +265,7 @@ def main():
     out_jsonl = os.path.join(cfg.out_dir, cfg.out_jsonl)
     out_state = os.path.join(cfg.out_dir, cfg.out_state)
     out_orders = os.path.join(cfg.out_dir, cfg.out_orders)
+    out_meta_state = os.path.join(cfg.out_dir, cfg.meta_risk_state)
 
     loader = MT5DataLoader(expected_freq="1min", tz=None)
     fb = FeatureBuilder(FeatureConfig(dropna=False, add_atr=True))
@@ -322,6 +327,21 @@ def main():
     pos = 0  # -1/0/1
     entry_price = None
     entry_ts = None
+    entry_size = None
+    entry_regime = None
+    entry_hold_max = None
+    bars_in_pos = 0
+    paper_equity = 0.0
+
+    meta_state = None
+    if cfg.meta_risk_enabled:
+        meta_cfg = MetaRiskConfig()
+        meta_state = MetaRiskState(meta_cfg)
+        loaded = load_json(out_meta_state)
+        if loaded is not None:
+            meta_state = loaded
+            meta_state.cfg = meta_cfg
+    meta_save_counter = 0
 
     append_jsonl(out_jsonl, {"event": "START", "live_csv": cfg.live_csv, "ts": str(pd.Timestamp.now(tz="UTC"))})
 
@@ -433,9 +453,10 @@ def main():
         if session_ok and (not spike_block):
             if model_mode == "linear":
                 dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i])
+                regime = "na"
             else:
-                r = str(regime_arr[i]) if regime_arr is not None else "mixed"
-                dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i], r)
+                regime = str(regime_arr[i]) if regime_arr is not None else "mixed"
+                dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i], regime)
 
             feat_row = feat.iloc[i]
             confidence, allow_trade, reason = gate.evaluate(feat_row)
@@ -445,6 +466,8 @@ def main():
             tatr_use = max(cfg.atr_floor, float(tatr_i))
             vol_scale = float(np.clip(tatr_use / atr_use, cfg.min_vol_scale, cfg.max_vol_scale))
             final_size = float(base_size * vol_scale)
+            if meta_state is not None:
+                final_size = meta_state.apply_guardrails(regime, final_size)
 
             if allow_trade and dir_ != 0 and final_size > 1e-6:
                 action.update({
@@ -477,9 +500,33 @@ def main():
             pos = 1 if action["dir"] == 1 else -1
             entry_price = fill_price
             entry_ts = ts
-            order_event = {"type": "OPEN", "pos": int(pos), "entry_price": float(entry_price), "size": float(action["final_size"])}
+            entry_size = float(action["final_size"])
+            entry_regime = str(regime_arr[i]) if regime_arr is not None else "na"
+            entry_hold_max = int(action["hold_max"]) if action["hold_max"] else None
+            bars_in_pos = 0
+            order_event = {"type": "OPEN", "pos": int(pos), "entry_price": float(entry_price), "size": float(entry_size)}
         elif pos != 0:
             order_event = {"type": "HOLD", "pos": int(pos), "entry_price": float(entry_price) if entry_price is not None else None}
+
+        if pos != 0:
+            bars_in_pos += 1
+            if entry_hold_max is not None and entry_hold_max > 0 and bars_in_pos >= entry_hold_max:
+                pnl = 0.0
+                if entry_price is not None and entry_size is not None:
+                    pnl = (float(close_price) - float(entry_price)) * float(pos) * float(entry_size)
+                paper_equity += float(pnl)
+                if meta_state is not None:
+                    regime_close = entry_regime or "na"
+                    meta_state.update_trade(regime_close, float(pnl), date=str(ts))
+                    meta_state.update_daily_equity(float(paper_equity), str(ts))
+                order_event = {"type": "CLOSE", "pos": 0, "entry_price": float(close_price)}
+                pos = 0
+                entry_price = None
+                entry_ts = None
+                entry_size = None
+                entry_regime = None
+                entry_hold_max = None
+                bars_in_pos = 0
 
         log = {
             "event": "BAR",
@@ -510,6 +557,13 @@ def main():
                 "size": order_event.get("size"),
             }
             append_orders_csv(out_orders, o)
+
+        if meta_state is not None:
+            meta_state.update_daily_equity(float(paper_equity), str(ts))
+            meta_save_counter += 1
+            if cfg.meta_risk_save_every > 0 and meta_save_counter >= cfg.meta_risk_save_every:
+                save_json(out_meta_state, meta_state)
+                meta_save_counter = 0
 
         # persist state periodically (for resume)
         state = {"last_pos": int(last_pos), "bars": int(len(df_all)), "last_ts": str(ts)}
