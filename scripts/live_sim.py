@@ -1,3 +1,4 @@
+﻿import argparse
 import os
 import json
 import numpy as np
@@ -11,6 +12,7 @@ from rabit.env.metrics import compute_metrics, metrics_to_dict
 from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
+from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState, load_json, save_json
 
 from rabit.regime.regime_detector import RegimeDetector
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -28,6 +30,33 @@ def _pick_existing(paths: list[str]) -> str | None:
         if os.path.exists(p):
             return p
     return None
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run live simulator")
+    parser.add_argument("--meta_risk", type=int, default=1, help="Enable meta-risk scaling (1/0)")
+    parser.add_argument(
+        "--meta_risk_state",
+        type=str,
+        default="data/reports/meta_risk_state.json",
+        help="Path to load meta-risk state",
+    )
+    parser.add_argument(
+        "--meta_risk_out",
+        type=str,
+        default="data/reports/meta_risk_state.json",
+        help="Path to save meta-risk state",
+    )
+    parser.add_argument("--meta_risk_floor", type=float, default=0.2, help="Meta-risk minimum scale")
+    parser.add_argument("--meta_risk_cap", type=float, default=1.2, help="Meta-risk maximum scale")
+    parser.add_argument("--meta_risk_alpha", type=float, default=0.05, help="Meta-risk EWMA alpha")
+    parser.add_argument(
+        "--meta_risk_min_trades",
+        type=int,
+        default=30,
+        help="Min trades per regime before scaling",
+    )
+    return parser.parse_args(argv)
 
 
 def load_policy_system(n_features: int):
@@ -156,8 +185,9 @@ def _build_equity_from_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"ts": ts, "equity": equity, "pnl": pnl})
 
 
-def main():
+def main(argv=None):
     _ensure_reports_dir()
+    args = parse_args(argv)
 
     # ===== Config (production-ish defaults) =====
     m1_path = "data/XAUUSD_M1.csv"
@@ -172,6 +202,21 @@ def main():
         spread_open_cap=200,
         force_close_on_spread=False,
     )
+
+    meta_enabled = int(args.meta_risk) != 0
+    meta_state = None
+    if meta_enabled:
+        cfg = MetaRiskConfig(
+            alpha=args.meta_risk_alpha,
+            floor=args.meta_risk_floor,
+            cap=args.meta_risk_cap,
+            min_trades_per_regime=args.meta_risk_min_trades,
+        )
+        meta_state = MetaRiskState(cfg)
+        loaded = load_json(args.meta_risk_state)
+        if loaded is not None:
+            meta_state = loaded
+            meta_state.cfg = cfg
 
     # ===== Load + features =====
     loader = MT5DataLoader()
@@ -241,21 +286,25 @@ def main():
         **env_cfg
     )
 
-    idx = {"i": 0}
+    decision_meta = {
+        "regime": "unknown",
+        "meta_scale": 1.0,
+        "size_conf": 0.0,
+        "size": 0.0,
+    }
+    trade_meta = []
+    closed_idx = 0
 
-    def policy_func(_row):
-        i = idx["i"]
-        idx["i"] += 1
-
+    def policy_func(i: int):
         if i < warmup_bars:
             return (0, 0.8, 0.8, 20)
 
         # base action from model
         if mode == "linear":
             dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i])
-            regime = "mixed"
+            regime = "unknown"
         else:
-            regime = "mixed"
+            regime = "unknown"
             if regime_arr is not None:
                 regime = str(regime_arr[i])
             dir_, tp_mult, sl_mult, hold_max = model.act(X_all[i], regime)
@@ -266,15 +315,56 @@ def main():
         # confidence -> size
         feat_row = feat.iloc[i]
         confidence, _allow, _reason = gate.evaluate(feat_row)
-        size = float(weighter.size(float(confidence)))
+        size_conf = float(weighter.size(float(confidence)))
 
-        if size <= 1e-6:
+        meta_scale = 1.0
+        size_final = size_conf
+        if meta_state is not None:
+            meta_scale = float(meta_state.meta_scale(regime))
+            size_final = float(np.clip(size_conf * meta_scale, 0.0, 1.0))
+
+        decision_meta["regime"] = regime
+        decision_meta["meta_scale"] = meta_scale
+        decision_meta["size_conf"] = size_conf
+        decision_meta["size"] = size_final
+
+        if size_final <= 1e-6:
             return (0, 0.8, 0.8, 20)
 
         # TradingEnv supports size as 5th element (TASK-2A)
-        return (dir_, tp_mult, sl_mult, hold_max, size)
+        return (dir_, tp_mult, sl_mult, hold_max, size_final)
 
-    ledger = env.run_backtest(policy_func)
+    for i in range(len(env.df)):
+        prev_trade_count = len(env.ledger.trades)
+        action = policy_func(i)
+        env.step(i, action)
+
+        new_trades = len(env.ledger.trades) - prev_trade_count
+        if new_trades > 0:
+            for _ in range(new_trades):
+                trade_meta.append(
+                    {
+                        "regime": decision_meta.get("regime", "unknown"),
+                        "meta_scale": float(decision_meta.get("meta_scale", 1.0)),
+                        "size_conf": float(decision_meta.get("size_conf", 0.0)),
+                        "size": float(decision_meta.get("size", 0.0)),
+                    }
+                )
+
+        if meta_state is not None:
+            while closed_idx < len(env.ledger.trades):
+                trade = env.ledger.trades[closed_idx]
+                if trade.exit_time is None or trade.pnl is None:
+                    break
+                if closed_idx < len(trade_meta):
+                    regime = str(trade_meta[closed_idx].get("regime", "unknown"))
+                else:
+                    regime = "unknown"
+                exit_ts_str = str(trade.exit_time) if trade.exit_time is not None else ""
+                meta_state.update_trade(regime, float(trade.pnl), date=exit_ts_str)
+                closed_idx += 1
+
+    ledger = env.ledger
 
     # ===== Metrics =====
     m = compute_metrics(ledger)
@@ -288,6 +378,14 @@ def main():
     os.makedirs(os.path.dirname(out_trades_csv), exist_ok=True)
 
     trades_df = _ledger_to_trades_df(ledger)
+    if len(trade_meta) > 0:
+        meta_df = pd.DataFrame(trade_meta)
+        if len(meta_df) < len(trades_df):
+            meta_df = meta_df.reindex(range(len(trades_df)))
+        for col in ["regime", "meta_scale", "size_conf", "size"]:
+            if col in meta_df.columns:
+                trades_df[col] = meta_df[col].values
+
     trades_df.to_csv(out_trades_csv, index=False)
 
     # sanity: ensure CSV is real table, not "Ledger object ..."
@@ -312,10 +410,28 @@ def main():
     with open(out_summary_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    if meta_state is not None:
+        save_json(args.meta_risk_out, meta_state)
+
     print("Model:", mode, model_path)
     print("Weighter:", weighter.cfg)
     print("Metrics:", md)
     print("Saved:", out_trades_csv, out_equity_csv, out_summary_json)
+
+    if meta_enabled:
+        regimes_n = len(meta_state.regimes) if meta_state is not None else 0
+        if meta_state is None:
+            global_scale = "unknown"
+        elif "unknown" in meta_state.regimes:
+            global_scale = f"{meta_state.meta_scale('unknown'):.4f}"
+        elif len(meta_state.regimes) == 1:
+            only_regime = next(iter(meta_state.regimes))
+            global_scale = f"{meta_state.meta_scale(only_regime):.4f}"
+        else:
+            global_scale = "unknown"
+        print(f"[meta_risk] enabled=1 regimes={regimes_n} global_scale={global_scale}")
+    else:
+        print("[meta_risk] enabled=0")
 
 
 if __name__ == "__main__":
