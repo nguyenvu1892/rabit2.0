@@ -150,6 +150,11 @@ def main():
 
     # Fail-safe
     daily_dd_limit = 200.0        # if intraday DD exceeds this (balance units) => stop entry rest of day
+    # Volatility target sizing (TASK-2G)
+    atr_window = 240          # rolling window bars
+    min_vol_scale = 0.30
+    max_vol_scale = 1.00
+    atr_floor = 0.05          # avoid division blow-up
     max_loss_streak = 4           # consecutive losing trades => stop entry rest of day
     spread_hard_cap = 200         # keep your old spread_open_cap
     spread_spike_cap = 300        # additional fail-safe (if spread >= this => no entry)
@@ -188,6 +193,17 @@ def main():
 
     # env df needs atr
     df_env = df.join(feat[["atr"]], how="left").copy()
+
+    # rolling median ATR as target (shifted to avoid lookahead)
+    atr_series = (
+    df_env["atr"]
+    .astype(float)
+    .ffill()
+    .bfill()
+)
+    target_atr = atr_series.rolling(atr_window, min_periods=max(30, atr_window // 4)).median().shift(1)
+    target_atr = target_atr.fillna(target_atr.median())
+    df_env["target_atr"] = target_atr
 
     feature_cols = [
         "atr",
@@ -312,9 +328,21 @@ def main():
                     # confidence -> size
                     feat_row = feat.iloc[i]
                     confidence, _allow, _reason = gate.evaluate(feat_row)
-                    size = weighter.size(confidence)
-                    if size > 1e-6:
-                        action = (dir_, float(tp_mult), float(sl_mult), int(hold_max), float(size))
+                    base_size = float(weighter.size(confidence))
+
+                    # volatility scaling
+                    atr_i = float(df_env.iloc[i]["atr"])
+                    tatr_i = float(df_env.iloc[i].get("target_atr", atr_i))
+                    atr_i = max(atr_floor, atr_i)
+                    tatr_i = max(atr_floor, tatr_i)
+
+                    vol_scale = tatr_i / atr_i
+                    vol_scale = float(np.clip(vol_scale, min_vol_scale, max_vol_scale))
+
+                    final_size = base_size * vol_scale
+
+                    if final_size > 1e-6:
+                        action = (dir_, float(tp_mult), float(sl_mult), int(hold_max), float(final_size))
 
             # step env
             env.step(i, action)
@@ -340,6 +368,8 @@ def main():
                 "loss_streak": int(loss_streak),
                 "spread": int(spread_pts),
                 "regime": str(regime_arr[i]) if regime_arr is not None else "na",
+                "vol_scale": float(vol_scale) if "vol_scale" in locals() else 1.0,
+                "base_size": float(base_size) if "base_size" in locals() else 0.0,
             })
 
         # day summary
@@ -414,6 +444,12 @@ def main():
         "best_day": best_day,
         "worst_day": worst_day,
         "daily_table": daily_df.to_dict(orient="records"),
+        "vol_target_sizing": {
+            "atr_window": atr_window,
+            "min_vol_scale": min_vol_scale,
+            "max_vol_scale": max_vol_scale,
+            "atr_floor": atr_floor,
+        },
     }
 
     with open(out_daily_summary, "w", encoding="utf-8") as f:
