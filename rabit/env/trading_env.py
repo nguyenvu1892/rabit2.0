@@ -7,7 +7,7 @@ from rabit.env.execution import ExecutionEngine
 class TradingEnv:
     """
     TradingEnv v1.2 (knowledge-driven, no fixed setup):
-      - action = (dir, tp_mult, sl_mult, hold_max)
+      - action = (dir, tp_mult, sl_mult, hold_max[, size])
       - TP/SL computed from ATR * multiplier
       - gap/spread filters preserved
       - one position at a time (scalping)
@@ -43,7 +43,6 @@ class TradingEnv:
         self.tp_price: float | None = None
         self.sl_price: float | None = None
         self.hold_max: int | None = None
-
         self.last_ts: pd.Timestamp | None = None
 
     def _gap_minutes(self, ts: pd.Timestamp) -> int:
@@ -52,13 +51,18 @@ class TradingEnv:
         dt = ts - self.last_ts
         return int(dt.total_seconds() // 60)
 
-    def step(self, i: int, action: tuple[int, float, float, int]) -> None:
+    def step(
+        self,
+        i: int,
+        action: tuple[int, float, float, int] | tuple[int, float, float, int, float],
+    ) -> None:
         """
         action:
           dir: 0 hold, 1 long, 2 short
           tp_mult: e.g. 0.6 (ATR multiple)
           sl_mult: e.g. 0.6
           hold_max: minutes (time stop)
+          size: optional [0.0, 1.0]
         """
         ts = self.df.index[i]
         row = self.df.iloc[i]
@@ -94,10 +98,29 @@ class TradingEnv:
 
         # ENTRY
         if self.position == 0:
-            dir_, tp_mult, sl_mult, hold_max = action
+            if len(action) == 4:
+                dir_, tp_mult, sl_mult, hold_max = action
+                size = 1.0
+            elif len(action) == 5:
+                dir_, tp_mult, sl_mult, hold_max, size = action
+            else:
+                raise ValueError("action must be (dir, tp, sl, hold) or (dir, tp, sl, hold, size)")
 
-            # must pass spread filter
+            size = float(size)
+            if size < 0.0:
+                size = 0.0
+            elif size > 1.0:
+                size = 1.0
+
+            # skip if no size
+            if size == 0.0:
+                self.last_ts = ts
+                return
+
             if spread <= self.spread_open_cap:
+                tp_dist = max(0.05, float(tp_mult) * atr)
+                sl_dist = max(0.05, float(sl_mult) * atr)
+
                 if dir_ == 1:
                     fill = self.execution.market_fill(1, close_price, spread)
                     self.position = 1
@@ -106,10 +129,11 @@ class TradingEnv:
                     self.entry_i = i
                     self.hold_max = int(hold_max)
 
-                    self.tp_price = fill + max(0.05, float(tp_mult) * atr)
-                    self.sl_price = fill - max(0.05, float(sl_mult) * atr)
+                    self.tp_price = fill + tp_dist
+                    self.sl_price = fill - sl_dist
 
-                    self.ledger.open_trade(ts, 1, fill, volume=1)
+                    # ✅ scale ONLY via volume
+                    self.ledger.open_trade(ts, 1, fill, volume=size)
 
                 elif dir_ == 2:
                     fill = self.execution.market_fill(-1, close_price, spread)
@@ -119,11 +143,12 @@ class TradingEnv:
                     self.entry_i = i
                     self.hold_max = int(hold_max)
 
-                    self.tp_price = fill - max(0.05, float(tp_mult) * atr)
-                    self.sl_price = fill + max(0.05, float(sl_mult) * atr)
+                    self.tp_price = fill - tp_dist
+                    self.sl_price = fill + sl_dist
 
-                    self.ledger.open_trade(ts, -1, fill, volume=1)
-
+                    # ✅ scale ONLY via volume
+                    self.ledger.open_trade(ts, -1, fill, volume=size)
+                    
         # MANAGE
         if self.position != 0 and self.entry_price is not None:
             # time stop
