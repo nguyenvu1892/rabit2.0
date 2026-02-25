@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, Optional, Tuple
 import datetime
 
+_NONZERO_EPS = 1e-6
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -284,6 +286,8 @@ class MetaRiskState:
     def _scale_bounds(self) -> Tuple[float, float]:
         min_scale = _safe_float(getattr(self.cfg, "scale_min", None), _safe_float(getattr(self.cfg, "min_scale", 0.0), 0.0))
         max_scale = _safe_float(getattr(self.cfg, "scale_max", None), _safe_float(getattr(self.cfg, "max_scale", 1.0), 1.0))
+        if min_scale <= 0.0:
+            min_scale = _NONZERO_EPS
         if max_scale < min_scale:
             max_scale = min_scale
         return float(min_scale), float(max_scale)
@@ -291,6 +295,8 @@ class MetaRiskState:
     def _fallback_scale(self) -> float:
         min_scale, max_scale = self._scale_bounds()
         fallback = _safe_float(getattr(self.cfg, "global_fallback_scale", 1.0), 1.0)
+        if fallback <= 0.0:
+            fallback = 1.0
         return _clamp(fallback, min_scale, max_scale)
 
     def _performance_score(self, st: RegimeStats) -> float:
@@ -334,33 +340,36 @@ class MetaRiskState:
         return self._apply_dd_soft_limit(scale)
 
     def _compute_scale(self, regime: str, st: Optional[RegimeStats], update_state: bool) -> Tuple[float, str]:
-        fallback = self._fallback_scale()
+        min_scale, max_scale = self._scale_bounds()
+        base = _clamp(1.0, min_scale, max_scale)
+        dd_limit = _safe_float(getattr(self.cfg, "daily_dd_limit", 0.0), 0.0)
+        if dd_limit > 0.0 and self.daily_drawdown > dd_limit:
+            return base, "freeze_dd"
         if not regime:
-            return fallback, "fallback:no_regime"
+            return base, "fallback_no_regime"
         if st is None:
-            return fallback, "fallback:no_regime"
+            return base, "fallback_no_regime"
 
         n_trades = _safe_int(getattr(st, "n_trades", 0), 0)
         min_trades = _safe_int(getattr(self.cfg, "min_trades_per_regime", 1), 1)
         if n_trades < min_trades:
-            return fallback, "fallback:min_trades"
+            return base, "fallback_min_trades"
 
         candidate = self._scale_from_stats(st)
-        min_scale, max_scale = self._scale_bounds()
-        last_scale = _safe_float(getattr(st, "last_scale", fallback), fallback)
+        last_scale = _safe_float(getattr(st, "last_scale", base), base)
         last_scale = _clamp(last_scale, min_scale, max_scale)
 
         hysteresis = max(0.0, _safe_float(getattr(self.cfg, "hysteresis", 0.0), 0.0))
         if abs(candidate - last_scale) < hysteresis:
-            return last_scale, "hold:hysteresis"
+            return last_scale, "hold_hysteresis"
 
         cooldown = max(0, _safe_int(getattr(self.cfg, "cooldown_trades", 0), 0))
         last_update_n = _safe_int(getattr(st, "last_scale_update_n", 0), 0)
         trades_since = max(0, n_trades - last_update_n)
         if cooldown > 0 and trades_since < cooldown:
-            return last_scale, "hold:cooldown"
+            return last_scale, "hold_cooldown"
 
-        reason = "calib:up" if candidate > last_scale else "calib:down"
+        reason = "calib_up" if candidate > last_scale else "calib_down"
         if update_state:
             st.last_scale = candidate
             st.last_scale_update_n = n_trades
@@ -550,6 +559,8 @@ class MetaRiskState:
                 stats.loss_streak = _safe_int(stats.loss_streak, 0)
                 stats.ewma_loss_streak = _safe_float(stats.ewma_loss_streak, 0.0)
                 stats.last_scale = _safe_float(stats.last_scale, state._fallback_scale())
+                min_scale, max_scale = state._scale_bounds()
+                stats.last_scale = _clamp(stats.last_scale, min_scale, max_scale)
                 stats.last_scale_update_n = _safe_int(stats.last_scale_update_n, 0)
                 stats.ewma_return = _safe_float(stats.ewma_return, stats.ewma_pnl)
                 stats.ewma_vol = _safe_float(stats.ewma_vol, stats.ewma_abs_pnl)
