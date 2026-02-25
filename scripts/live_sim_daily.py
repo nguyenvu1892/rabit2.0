@@ -13,7 +13,7 @@ from rabit.env.metrics import compute_metrics, metrics_to_dict
 from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
-from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState, load_json, save_json
+from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 
 from rabit.regime.regime_detector import RegimeDetector
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -171,10 +171,19 @@ def main():
             loss_streak_limit=max_loss_streak,
         )
         meta_state = MetaRiskState(meta_cfg)
-        loaded = load_json(meta_state_path)
-        if loaded is not None:
-            meta_state = loaded
-            meta_state.cfg = meta_cfg
+        if os.path.exists(meta_state_path):
+            loaded = None
+            try:
+                loaded = MetaRiskState.load_json(meta_cfg, meta_state_path)
+            except Exception as e:
+                print(f"[meta_risk] warn failed to load state from {meta_state_path}: {e}")
+                loaded = None
+            if loaded is not None:
+                meta_state = loaded
+                meta_state.cfg = meta_cfg
+                print(f"[meta_risk] loaded state from {meta_state_path}")
+            else:
+                print(f"[meta_risk] warn failed to load state from {meta_state_path}; using fresh state")
 
     # Env config
     env_cfg = dict(
@@ -459,7 +468,16 @@ def main():
         # roll global balance (carry PnL forward)
         global_balance = bal_end
         if meta_state is not None:
-            save_json(meta_state_out, meta_state)
+            saved = False
+            try:
+                saved = meta_state.save_json(meta_state_out)
+            except Exception as e:
+                print(f"[meta_risk] warn failed to save state to {meta_state_out}: {e}")
+                saved = False
+            if saved:
+                print(f"[meta_risk] saved state to {meta_state_out}")
+            else:
+                print(f"[meta_risk] warn failed to save state to {meta_state_out}")
 
     # ======================
     # FINAL REPORTS

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import time
 import json
@@ -16,7 +17,7 @@ from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
 from rabit.rl.regime_policy_bank import RegimePolicyBank
-from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState, load_json, save_json
+from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 from rabit.regime.regime_detector import RegimeDetector
 
 from rabit.env.execution_model import ExecutionModel, ExecutionConfig
@@ -72,6 +73,35 @@ class PaperLiveConfig:
 # -------------------------
 # Utilities
 # -------------------------
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Paper live runner")
+    ap.add_argument(
+        "--meta_state_in",
+        type=str,
+        default=None,
+        help="Path to load meta-risk state (default: out_dir/meta_risk_state.json if exists)",
+    )
+    ap.add_argument(
+        "--meta_state_out",
+        type=str,
+        default=None,
+        help="Path to save meta-risk state (default: out_dir/meta_risk_state.json)",
+    )
+    ap.add_argument(
+        "--meta_persist",
+        type=int,
+        default=None,
+        help="Persist meta-risk state (1/0). Default: 1 when meta-risk enabled.",
+    )
+    ap.add_argument(
+        "--meta_risk",
+        type=int,
+        default=None,
+        help="Enable meta-risk (1/0). Default: config value.",
+    )
+    return ap.parse_args(argv)
+
 
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
@@ -259,13 +289,26 @@ def normalize_chunk_to_ohlc(df_raw: pd.DataFrame) -> pd.DataFrame:
 # -------------------------
 
 def main():
+    args = parse_args()
     cfg = PaperLiveConfig()
+    if args.meta_risk is not None:
+        cfg.meta_risk_enabled = int(args.meta_risk) != 0
     ensure_dir(cfg.out_dir)
 
     out_jsonl = os.path.join(cfg.out_dir, cfg.out_jsonl)
     out_state = os.path.join(cfg.out_dir, cfg.out_state)
     out_orders = os.path.join(cfg.out_dir, cfg.out_orders)
     out_meta_state = os.path.join(cfg.out_dir, cfg.meta_risk_state)
+
+    meta_state_in = args.meta_state_in
+    if meta_state_in is None and os.path.exists(out_meta_state):
+        meta_state_in = out_meta_state
+    meta_state_out = args.meta_state_out or out_meta_state
+    meta_persist = args.meta_persist
+    if meta_persist is None:
+        meta_persist = 1 if cfg.meta_risk_enabled else 0
+    else:
+        meta_persist = 1 if int(meta_persist) != 0 else 0
 
     loader = MT5DataLoader(expected_freq="1min", tz=None)
     fb = FeatureBuilder(FeatureConfig(dropna=False, add_atr=True))
@@ -337,10 +380,19 @@ def main():
     if cfg.meta_risk_enabled:
         meta_cfg = MetaRiskConfig()
         meta_state = MetaRiskState(meta_cfg)
-        loaded = load_json(out_meta_state)
-        if loaded is not None:
-            meta_state = loaded
-            meta_state.cfg = meta_cfg
+        if meta_persist and meta_state_in and os.path.exists(meta_state_in):
+            loaded = None
+            try:
+                loaded = MetaRiskState.load_json(meta_cfg, meta_state_in)
+            except Exception as e:
+                print(f"[meta_risk] warn failed to load state from {meta_state_in}: {e}")
+                loaded = None
+            if loaded is not None:
+                meta_state = loaded
+                meta_state.cfg = meta_cfg
+                print(f"[meta_risk] loaded state from {meta_state_in}")
+            else:
+                print(f"[meta_risk] warn failed to load state from {meta_state_in}; using fresh state")
     meta_save_counter = 0
 
     append_jsonl(out_jsonl, {"event": "START", "live_csv": cfg.live_csv, "ts": str(pd.Timestamp.now(tz="UTC"))})
@@ -576,10 +628,20 @@ def main():
 
         if meta_state is not None:
             meta_state.update_daily_equity(float(paper_equity), str(ts))
-            meta_save_counter += 1
-            if cfg.meta_risk_save_every > 0 and meta_save_counter >= cfg.meta_risk_save_every:
-                save_json(out_meta_state, meta_state)
-                meta_save_counter = 0
+            if meta_persist:
+                meta_save_counter += 1
+                if cfg.meta_risk_save_every > 0 and meta_save_counter >= cfg.meta_risk_save_every:
+                    saved = False
+                    try:
+                        saved = meta_state.save_json(meta_state_out)
+                    except Exception as e:
+                        print(f"[meta_risk] warn failed to save state to {meta_state_out}: {e}")
+                        saved = False
+                    if saved:
+                        print(f"[meta_risk] saved state to {meta_state_out}")
+                    else:
+                        print(f"[meta_risk] warn failed to save state to {meta_state_out}")
+                    meta_save_counter = 0
 
         # persist state periodically (for resume)
         state = {"last_pos": int(last_pos), "bars": int(len(df_all)), "last_ts": str(ts)}

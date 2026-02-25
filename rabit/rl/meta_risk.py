@@ -56,6 +56,13 @@ def _normalize_ts(value: Any) -> str:
     return str(value)
 
 
+def _normalize_optional_ts(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    ts = _normalize_ts(value)
+    return ts if ts else None
+
+
 @dataclass(init=False)
 class MetaRiskConfig:
     min_trades_per_regime: int
@@ -511,27 +518,65 @@ class MetaRiskState:
         scale, _reason = self.meta_scale_with_reason(regime, update_state=False)
         return scale
 
-    def to_json_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
+        regimes_out: Dict[str, Dict[str, Any]] = {}
+        for key, stats in self.regimes.items():
+            st = asdict(stats)
+            st["n_trades"] = _safe_int(st.get("n_trades", 0), 0)
+            st["ewma_pnl"] = _safe_float(st.get("ewma_pnl", 0.0), 0.0)
+            st["ewma_abs_pnl"] = _safe_float(st.get("ewma_abs_pnl", 0.0), 0.0)
+            st["ewma_win"] = _safe_float(st.get("ewma_win", 0.0), 0.0)
+            st["ewma_loss"] = _safe_float(st.get("ewma_loss", 0.0), 0.0)
+            st["loss_streak"] = _safe_int(st.get("loss_streak", 0), 0)
+            st["ewma_loss_streak"] = _safe_float(st.get("ewma_loss_streak", 0.0), 0.0)
+            st["last_update_ts"] = _normalize_optional_ts(st.get("last_update_ts"))
+            st["last_scale"] = _safe_float(st.get("last_scale", 1.0), 1.0)
+            st["last_scale_update_n"] = _safe_int(st.get("last_scale_update_n", 0), 0)
+            if st.get("last_meta_reason") is not None:
+                st["last_meta_reason"] = str(st.get("last_meta_reason"))
+            else:
+                st["last_meta_reason"] = None
+            st["ewma_return"] = _safe_float(st.get("ewma_return", st.get("ewma_pnl", 0.0)), 0.0)
+            st["ewma_vol"] = _safe_float(st.get("ewma_vol", st.get("ewma_abs_pnl", 0.0)), 0.0)
+            st["ewma_winrate"] = _safe_float(st.get("ewma_winrate", st.get("ewma_win", 0.0)), 0.0)
+            regimes_out[str(key)] = st
+
+        freeze_out: Dict[str, Optional[str]] = {}
+        if isinstance(self.regime_freeze_until, dict):
+            for key, value in self.regime_freeze_until.items():
+                freeze_out[str(key)] = _normalize_optional_ts(value)
+
+        last_meta: Dict[str, Optional[str]] = {}
+        if isinstance(self.last_meta_reason_by_regime, dict):
+            for key, value in self.last_meta_reason_by_regime.items():
+                last_meta[str(key)] = str(value) if value is not None else None
+
         return {
             "config": asdict(self.cfg),
-            "regimes": {key: asdict(stats) for key, stats in self.regimes.items()},
-            "daily_equity_peak": float(self.daily_equity_peak),
-            "daily_drawdown": float(self.daily_drawdown),
-            "loss_streak": int(self.loss_streak),
-            "regime_freeze_until": dict(self.regime_freeze_until),
-            "daily_date": self.daily_date,
-            "last_guard_reason": self.last_guard_reason,
-            "last_guard_regime": self.last_guard_regime,
-            "last_guard_date": self.last_guard_date,
+            "regimes": regimes_out,
+            "daily_equity_peak": float(self.daily_equity_peak or 0.0),
+            "daily_drawdown": float(self.daily_drawdown or 0.0),
+            "loss_streak": int(self.loss_streak or 0),
+            "regime_freeze_until": freeze_out,
+            "daily_date": _normalize_optional_ts(self.daily_date),
+            "last_guard_reason": str(self.last_guard_reason or "ok"),
+            "last_guard_regime": str(self.last_guard_regime) if self.last_guard_regime is not None else None,
+            "last_guard_date": _normalize_optional_ts(self.last_guard_date),
+            "last_meta_reason_by_regime": last_meta,
         }
 
+    def to_json_dict(self) -> Dict[str, Any]:
+        return self.to_dict()
+
     @classmethod
-    def from_json_dict(cls, data: Dict[str, Any]) -> "MetaRiskState":
+    def from_dict(cls, cfg: Optional[MetaRiskConfig], data: Dict[str, Any]) -> "MetaRiskState":
         if not isinstance(data, dict):
             data = {}
 
-        cfg_data = data.get("config", {})
-        cfg = MetaRiskConfig(**_normalize_cfg_kwargs(cfg_data))
+        if cfg is None:
+            cfg_data = data.get("config", {})
+            cfg = MetaRiskConfig(**_normalize_cfg_kwargs(cfg_data))
+
         state = cls(cfg)
 
         regimes_data = data.get("regimes", {})
@@ -558,10 +603,13 @@ class MetaRiskState:
                 stats.ewma_loss = _safe_float(stats.ewma_loss, 0.0)
                 stats.loss_streak = _safe_int(stats.loss_streak, 0)
                 stats.ewma_loss_streak = _safe_float(stats.ewma_loss_streak, 0.0)
+                stats.last_update_ts = _normalize_optional_ts(stats.last_update_ts)
                 stats.last_scale = _safe_float(stats.last_scale, state._fallback_scale())
                 min_scale, max_scale = state._scale_bounds()
                 stats.last_scale = _clamp(stats.last_scale, min_scale, max_scale)
                 stats.last_scale_update_n = _safe_int(stats.last_scale_update_n, 0)
+                if stats.last_meta_reason is not None:
+                    stats.last_meta_reason = str(stats.last_meta_reason)
                 stats.ewma_return = _safe_float(stats.ewma_return, stats.ewma_pnl)
                 stats.ewma_vol = _safe_float(stats.ewma_vol, stats.ewma_abs_pnl)
                 stats.ewma_winrate = _safe_float(stats.ewma_winrate, stats.ewma_win)
@@ -572,18 +620,29 @@ class MetaRiskState:
         state.loss_streak = int(data.get("loss_streak", 0) or 0)
         freeze = data.get("regime_freeze_until", {})
         if isinstance(freeze, dict):
-            state.regime_freeze_until = {str(k): str(v) for k, v in freeze.items()}
+            state.regime_freeze_until = {str(k): _normalize_optional_ts(v) for k, v in freeze.items()}
         else:
             state.regime_freeze_until = {}
-        state.daily_date = data.get("daily_date")
+        state.daily_date = _normalize_optional_ts(data.get("daily_date"))
         state.last_guard_reason = str(data.get("last_guard_reason", "ok") or "ok")
         last_regime = data.get("last_guard_regime")
         state.last_guard_regime = str(last_regime) if last_regime is not None else None
-        state.last_guard_date = data.get("last_guard_date")
+        state.last_guard_date = _normalize_optional_ts(data.get("last_guard_date"))
+        last_meta = data.get("last_meta_reason_by_regime", {})
+        if isinstance(last_meta, dict):
+            state.last_meta_reason_by_regime = {
+                str(k): str(v) if v is not None else None for k, v in last_meta.items()
+            }
+        else:
+            state.last_meta_reason_by_regime = {}
         return state
 
+    @classmethod
+    def from_json_dict(cls, data: Dict[str, Any]) -> "MetaRiskState":
+        return cls.from_dict(None, data)
+
     def save(self, path: str) -> None:
-        data = self.to_json_dict()
+        data = self.to_dict()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
 
@@ -591,14 +650,16 @@ class MetaRiskState:
     def load(cls, path: str) -> "MetaRiskState":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return cls.from_json_dict(data)
+        return cls.from_dict(None, data)
 
     def save_json(self, path: str) -> bool:
         return save_json(path, self)
 
     @classmethod
-    def load_json(cls, path: str) -> Optional["MetaRiskState"]:
-        return load_json(path)
+    def load_json(cls, cfg: Optional[MetaRiskConfig], path: Optional[str] = None) -> Optional["MetaRiskState"]:
+        if path is None and isinstance(cfg, str):
+            return load_json(None, cfg)
+        return load_json(cfg, path)
 
 
 def save_json(path: str, state: MetaRiskState) -> bool:
@@ -610,13 +671,19 @@ def save_json(path: str, state: MetaRiskState) -> bool:
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(state.to_json_dict(), f, indent=2, sort_keys=True)
+            json.dump(state.to_dict(), f, indent=2, sort_keys=True)
         return True
     except Exception:
         return False
 
 
-def load_json(path: str) -> Optional[MetaRiskState]:
+def load_json(cfg_or_path: Optional[MetaRiskConfig], path: Optional[str] = None) -> Optional[MetaRiskState]:
+    if path is None:
+        path = str(cfg_or_path) if cfg_or_path is not None else ""
+        cfg = None
+    else:
+        cfg = cfg_or_path
+
     if not path:
         return None
     if not os.path.exists(path):
@@ -625,7 +692,7 @@ def load_json(path: str) -> Optional[MetaRiskState]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return MetaRiskState.from_json_dict(data)
+        return MetaRiskState.from_dict(cfg, data)
     except Exception:
         return None
 
