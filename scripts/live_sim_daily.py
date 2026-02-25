@@ -334,6 +334,7 @@ def main():
             size_conf = 0.0
             base_size = 0.0
             meta_scale = 1.0
+            meta_reason = "fallback:disabled"
             size_pre_guard = 0.0
             size_pre_guard_vol = 0.0
             size_final = 0.0
@@ -361,7 +362,8 @@ def main():
 
                     meta_scale = 1.0
                     if meta_state is not None:
-                        meta_scale = float(meta_state.meta_scale(regime))
+                        meta_scale, meta_reason = meta_state.meta_scale_with_reason(regime)
+                        meta_scale = float(meta_scale)
                     size_pre_guard = float(size_conf * meta_scale)
 
                     # volatility scaling
@@ -416,6 +418,7 @@ def main():
                 "base_size": float(base_size),
                 "size_conf": float(size_conf),
                 "meta_scale": float(meta_scale),
+                "meta_reason": str(meta_reason),
                 "size_pre_guard": float(size_pre_guard),
                 "size": float(size_final),
                 "guard_reason": str(guard_reason),
