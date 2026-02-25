@@ -133,11 +133,21 @@ def main() -> None:
     ap.add_argument("--out_dir", default="data/reports", help="Output directory")
 
     ap.add_argument("--min_trades_per_regime", type=int, default=50)
-    ap.add_argument("--ewma_alpha", type=float, default=0.05)
+    ap.add_argument("--ewma_alpha", type=float, default=0.10)
     ap.add_argument("--score_clip", type=float, default=3.0)
-    ap.add_argument("--min_scale", type=float, default=0.25)
-    ap.add_argument("--max_scale", type=float, default=1.25)
+    ap.add_argument("--min_scale", type=float, default=0.40)
+    ap.add_argument("--max_scale", type=float, default=1.20)
     ap.add_argument("--k", type=float, default=1.0)
+    ap.add_argument("--scale_min", type=float, default=None)
+    ap.add_argument("--scale_max", type=float, default=None)
+    ap.add_argument("--down_power", type=float, default=None)
+    ap.add_argument("--up_power", type=float, default=None)
+    ap.add_argument("--hysteresis", type=float, default=None)
+    ap.add_argument("--cooldown_trades", type=int, default=None)
+    ap.add_argument("--global_fallback_scale", type=float, default=None)
+    ap.add_argument("--target_pf", type=float, default=None)
+    ap.add_argument("--target_return", type=float, default=None)
+    ap.add_argument("--dd_soft_limit", type=float, default=None)
 
     ap.add_argument("--regime_col", default="", help="Override regime column name")
     ap.add_argument("--return_col", default="", help="Override return column name")
@@ -179,14 +189,35 @@ def main() -> None:
         default=None,
     )
 
-    cfg = MetaRiskConfig(
-        min_trades_per_regime=int(args.min_trades_per_regime),
-        ewma_alpha=float(args.ewma_alpha),
-        score_clip=float(args.score_clip),
-        min_scale=float(args.min_scale),
-        max_scale=float(args.max_scale),
-        k=float(args.k),
-    )
+    cfg_kwargs: Dict[str, Any] = {
+        "min_trades_per_regime": int(args.min_trades_per_regime),
+        "ewma_alpha": float(args.ewma_alpha),
+        "score_clip": float(args.score_clip),
+        "min_scale": float(args.min_scale),
+        "max_scale": float(args.max_scale),
+        "k": float(args.k),
+    }
+    if args.scale_min is not None:
+        cfg_kwargs["scale_min"] = float(args.scale_min)
+    if args.scale_max is not None:
+        cfg_kwargs["scale_max"] = float(args.scale_max)
+    if args.down_power is not None:
+        cfg_kwargs["down_power"] = float(args.down_power)
+    if args.up_power is not None:
+        cfg_kwargs["up_power"] = float(args.up_power)
+    if args.hysteresis is not None:
+        cfg_kwargs["hysteresis"] = float(args.hysteresis)
+    if args.cooldown_trades is not None:
+        cfg_kwargs["cooldown_trades"] = int(args.cooldown_trades)
+    if args.global_fallback_scale is not None:
+        cfg_kwargs["global_fallback_scale"] = float(args.global_fallback_scale)
+    if args.target_pf is not None:
+        cfg_kwargs["target_pf"] = float(args.target_pf)
+    if args.target_return is not None:
+        cfg_kwargs["target_return"] = float(args.target_return)
+    if args.dd_soft_limit is not None:
+        cfg_kwargs["dd_soft_limit"] = float(args.dd_soft_limit)
+    cfg = MetaRiskConfig(**cfg_kwargs)
     state = MetaRiskState(cfg)
 
     regimes = (
@@ -223,9 +254,16 @@ def main() -> None:
             {
                 "regime": str(regime),
                 "n_trades": int(getattr(st, "n_trades", 0)),
+                "ewma_pnl": float(getattr(st, "ewma_pnl", getattr(st, "ewma_return", 0.0))),
+                "ewma_abs_pnl": float(getattr(st, "ewma_abs_pnl", getattr(st, "ewma_vol", 0.0))),
+                "ewma_win": float(getattr(st, "ewma_win", getattr(st, "ewma_winrate", 0.0))),
                 "ewma_return": float(getattr(st, "ewma_return", 0.0)),
                 "ewma_vol": float(getattr(st, "ewma_vol", 0.0)),
                 "ewma_winrate": float(getattr(st, "ewma_winrate", 0.0)),
+                "loss_streak": int(getattr(st, "loss_streak", 0)),
+                "last_scale": float(getattr(st, "last_scale", cfg.global_fallback_scale)),
+                "last_scale_update_n": int(getattr(st, "last_scale_update_n", 0)),
+                "meta_reason": getattr(st, "last_meta_reason", None),
                 "meta_scale": float(state.meta_scale(str(regime))),
                 "last_update_ts": getattr(st, "last_update_ts", None),
             }

@@ -53,9 +53,9 @@ def parse_args(argv=None):
         default="data/reports/meta_risk_state.json",
         help="Path to save meta-risk state",
     )
-    parser.add_argument("--meta_risk_floor", type=float, default=0.2, help="Meta-risk minimum scale")
+    parser.add_argument("--meta_risk_floor", type=float, default=0.4, help="Meta-risk minimum scale")
     parser.add_argument("--meta_risk_cap", type=float, default=1.2, help="Meta-risk maximum scale")
-    parser.add_argument("--meta_risk_alpha", type=float, default=0.05, help="Meta-risk EWMA alpha")
+    parser.add_argument("--meta_risk_alpha", type=float, default=0.10, help="Meta-risk EWMA alpha")
     parser.add_argument(
         "--meta_risk_min_trades",
         type=int,
@@ -242,6 +242,11 @@ def main(argv=None):
         if loaded is not None:
             meta_state = loaded
             meta_state.cfg = cfg
+            meta_state.daily_drawdown = 0.0
+            meta_state.daily_equity_peak = 0.0
+            meta_state.daily_date = None
+            meta_state.loss_streak = 0
+            meta_state.regime_freeze_until = {}
 
     # ===== Load + features =====
     loader = MT5DataLoader()
@@ -314,15 +319,19 @@ def main(argv=None):
     decision_meta = {
         "regime": "unknown",
         "meta_scale": 1.0,
+        "meta_reason": "fallback:disabled",
         "size_conf": 0.0,
         "size_pre_guard": 0.0,
         "size": 0.0,
+        "final_size": 0.0,
         "guard_reason": "ok",
     }
     trade_meta = []
     closed_idx = 0
 
     def policy_func(i: int):
+        if meta_state is not None:
+            meta_state.daily_date = str(env.df.index[i])[:10]
         if i < warmup_bars:
             return (0, 0.8, 0.8, 20)
 
@@ -343,8 +352,10 @@ def main(argv=None):
         feat_row = feat.iloc[i]
         confidence, _allow, _reason = gate.evaluate(feat_row)
         meta_scale = 1.0
+        meta_reason = "fallback:disabled"
         if meta_state is not None:
-            meta_scale = float(meta_state.meta_scale(regime))
+            meta_scale, meta_reason = meta_state.meta_scale_with_reason(regime)
+            meta_scale = float(meta_scale)
 
         effective_power = base_power
         if meta_feedback_enabled:
@@ -364,9 +375,11 @@ def main(argv=None):
 
         decision_meta["regime"] = regime
         decision_meta["meta_scale"] = meta_scale
+        decision_meta["meta_reason"] = meta_reason
         decision_meta["size_conf"] = size_conf
         decision_meta["size_pre_guard"] = size_pre_guard
         decision_meta["size"] = size_final
+        decision_meta["final_size"] = size_final
         decision_meta["guard_reason"] = guard_reason
 
         if size_final <= 1e-6:
@@ -387,9 +400,11 @@ def main(argv=None):
                     {
                         "regime": decision_meta.get("regime", "unknown"),
                         "meta_scale": float(decision_meta.get("meta_scale", 1.0)),
+                        "meta_reason": str(decision_meta.get("meta_reason", "ok")),
                         "size_conf": float(decision_meta.get("size_conf", 0.0)),
                         "size_pre_guard": float(decision_meta.get("size_pre_guard", 0.0)),
                         "size": float(decision_meta.get("size", 0.0)),
+                        "final_size": float(decision_meta.get("final_size", 0.0)),
                         "guard_reason": str(decision_meta.get("guard_reason", "ok")),
                     }
                 )
@@ -425,7 +440,16 @@ def main(argv=None):
         meta_df = pd.DataFrame(trade_meta)
         if len(meta_df) < len(trades_df):
             meta_df = meta_df.reindex(range(len(trades_df)))
-        for col in ["regime", "meta_scale", "size_conf", "size_pre_guard", "size", "guard_reason"]:
+        for col in [
+            "regime",
+            "meta_scale",
+            "meta_reason",
+            "size_conf",
+            "size_pre_guard",
+            "size",
+            "final_size",
+            "guard_reason",
+        ]:
             if col in meta_df.columns:
                 trades_df[col] = meta_df[col].values
 
