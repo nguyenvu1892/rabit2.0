@@ -319,7 +319,7 @@ def main(argv=None):
     decision_meta = {
         "regime": "unknown",
         "meta_scale": 1.0,
-        "meta_reason": "fallback:disabled",
+        "meta_reason": "fallback_no_regime",
         "size_conf": 0.0,
         "size_pre_guard": 0.0,
         "size": 0.0,
@@ -352,7 +352,7 @@ def main(argv=None):
         feat_row = feat.iloc[i]
         confidence, _allow, _reason = gate.evaluate(feat_row)
         meta_scale = 1.0
-        meta_reason = "fallback:disabled"
+        meta_reason = "fallback_no_regime"
         if meta_state is not None:
             meta_scale, meta_reason = meta_state.meta_scale_with_reason(regime)
             meta_scale = float(meta_scale)
@@ -436,44 +436,45 @@ def main(argv=None):
     os.makedirs(os.path.dirname(out_trades_csv), exist_ok=True)
 
     trades_df = _ledger_to_trades_df(ledger)
-    if len(trade_meta) > 0:
-        meta_df = pd.DataFrame(trade_meta)
-        if len(meta_df) < len(trades_df):
-            meta_df = meta_df.reindex(range(len(trades_df)))
-        for col in [
-            "regime",
-            "meta_scale",
-            "meta_reason",
-            "size_conf",
-            "size_pre_guard",
-            "size",
-            "final_size",
-            "guard_reason",
-        ]:
-            if col in meta_df.columns:
-                trades_df[col] = meta_df[col].values
-
-    trades_df.to_csv(out_trades_csv, index=False)
-
-    # -------------------------------
-    # Safe integrity check
-    # -------------------------------
-    chk = None
-
-    if os.path.exists(out_trades_csv) and os.path.getsize(out_trades_csv) > 10:
-        try:
-            chk = pd.read_csv(out_trades_csv)
-        except Exception as e:
-            print("[warn] trade file read failed:", e)
-    else:
+    if len(trades_df) == 0:
         print("[warn] live_sim_trades.csv empty or no trades generated.")
+        trades_df.to_csv(out_trades_csv, index=False)
+    else:
+        if len(trade_meta) > 0:
+            meta_df = pd.DataFrame(trade_meta)
+            if len(meta_df) < len(trades_df):
+                meta_df = meta_df.reindex(range(len(trades_df)))
+            for col in [
+                "regime",
+                "meta_scale",
+                "meta_reason",
+                "size_conf",
+                "size_pre_guard",
+                "size",
+                "final_size",
+                "guard_reason",
+            ]:
+                if col in meta_df.columns:
+                    trades_df[col] = meta_df[col].values
 
-    if chk is not None:
-        if chk.shape[0] == 0 or chk.shape[1] <= 1:
-            print(
-                f"[warn] trade file suspicious shape={chk.shape}, cols={chk.columns.tolist()}"
-            )
-        
+        trades_df.to_csv(out_trades_csv, index=False)
+
+        # -------------------------------
+        # Safe integrity check
+        # -------------------------------
+        chk = None
+
+        if os.path.exists(out_trades_csv) and os.path.getsize(out_trades_csv) > 10:
+            try:
+                chk = pd.read_csv(out_trades_csv)
+            except Exception as e:
+                print("[warn] trade file read failed:", e)
+
+        if chk is not None:
+            if chk.shape[0] == 0 or chk.shape[1] <= 1:
+                print(
+                    f"[warn] trade file suspicious shape={chk.shape}, cols={chk.columns.tolist()}"
+                )
 
     equity_df = _build_equity_from_trades(trades_df)
     equity_df.to_csv(out_equity_csv, index=False)
@@ -508,16 +509,20 @@ def main(argv=None):
 
     if meta_enabled:
         regimes_n = len(meta_state.regimes) if meta_state is not None else 0
-        if meta_state is None:
-            global_scale = "unknown"
-        elif "unknown" in meta_state.regimes:
-            global_scale = f"{meta_state.meta_scale('unknown'):.4f}"
-        elif len(meta_state.regimes) == 1:
-            only_regime = next(iter(meta_state.regimes))
-            global_scale = f"{meta_state.meta_scale(only_regime):.4f}"
+        if meta_state is None or regimes_n == 0:
+            global_scale = 1.0
         else:
-            global_scale = "unknown"
-        print(f"[meta_risk] enabled=1 regimes={regimes_n} global_scale={global_scale}")
+            total_trades = 0.0
+            weighted = 0.0
+            for regime_key, st in meta_state.regimes.items():
+                n = float(getattr(st, "n_trades", 0) or 0)
+                total_trades += n
+                weighted += float(meta_state.meta_scale(str(regime_key))) * n
+            if total_trades > 0:
+                global_scale = weighted / total_trades
+            else:
+                global_scale = 1.0
+        print(f"[meta_risk] enabled=1 regimes={regimes_n} global_scale={global_scale:.4f}")
     else:
         print("[meta_risk] enabled=0")
 
