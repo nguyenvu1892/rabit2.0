@@ -12,7 +12,7 @@ from rabit.env.metrics import compute_metrics, metrics_to_dict
 from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
-from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState, load_json, save_json
+from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 
 from rabit.regime.regime_detector import RegimeDetector
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -42,16 +42,34 @@ def parse_args(argv=None):
         help="Enable meta-risk feedback into confidence power (1/0)",
     )
     parser.add_argument(
-        "--meta_risk_state",
+        "--meta_state_in",
+        type=str,
+        default=None,
+        help="Path to load meta-risk state (default: data/reports/meta_risk_state.json if exists)",
+    )
+    parser.add_argument(
+        "--meta_state_out",
         type=str,
         default="data/reports/meta_risk_state.json",
-        help="Path to load meta-risk state",
+        help="Path to save meta-risk state",
+    )
+    parser.add_argument(
+        "--meta_persist",
+        type=int,
+        default=None,
+        help="Persist meta-risk state (1/0). Default: 1 when meta-risk enabled.",
+    )
+    parser.add_argument(
+        "--meta_risk_state",
+        type=str,
+        default=None,
+        help="(legacy) Path to load meta-risk state",
     )
     parser.add_argument(
         "--meta_risk_out",
         type=str,
-        default="data/reports/meta_risk_state.json",
-        help="Path to save meta-risk state",
+        default=None,
+        help="(legacy) Path to save meta-risk state",
     )
     parser.add_argument("--meta_risk_floor", type=float, default=0.4, help="Meta-risk minimum scale")
     parser.add_argument("--meta_risk_cap", type=float, default=1.2, help="Meta-risk maximum scale")
@@ -229,6 +247,19 @@ def main(argv=None):
     )
 
     meta_enabled = int(args.meta_risk) != 0
+    meta_persist = args.meta_persist
+    if meta_persist is None:
+        meta_persist = 1 if meta_enabled else 0
+    else:
+        meta_persist = 1 if int(meta_persist) != 0 else 0
+
+    meta_state_in = args.meta_state_in or args.meta_risk_state
+    if meta_state_in is None:
+        default_in = "data/reports/meta_risk_state.json"
+        if os.path.exists(default_in):
+            meta_state_in = default_in
+
+    meta_state_out = args.meta_state_out or args.meta_risk_out or "data/reports/meta_risk_state.json"
     meta_state = None
     if meta_enabled:
         cfg = MetaRiskConfig(
@@ -238,15 +269,24 @@ def main(argv=None):
             min_trades_per_regime=args.meta_risk_min_trades,
         )
         meta_state = MetaRiskState(cfg)
-        loaded = load_json(args.meta_risk_state)
-        if loaded is not None:
-            meta_state = loaded
-            meta_state.cfg = cfg
-            meta_state.daily_drawdown = 0.0
-            meta_state.daily_equity_peak = 0.0
-            meta_state.daily_date = None
-            meta_state.loss_streak = 0
-            meta_state.regime_freeze_until = {}
+        if meta_persist and meta_state_in and os.path.exists(meta_state_in):
+            loaded = None
+            try:
+                loaded = MetaRiskState.load_json(cfg, meta_state_in)
+            except Exception as e:
+                print(f"[meta_risk] warn failed to load state from {meta_state_in}: {e}")
+                loaded = None
+            if loaded is not None:
+                meta_state = loaded
+                meta_state.cfg = cfg
+                meta_state.daily_drawdown = 0.0
+                meta_state.daily_equity_peak = 0.0
+                meta_state.daily_date = None
+                meta_state.loss_streak = 0
+                meta_state.regime_freeze_until = {}
+                print(f"[meta_risk] loaded state from {meta_state_in}")
+            else:
+                print(f"[meta_risk] warn failed to load state from {meta_state_in}; using fresh state")
 
     # ===== Load + features =====
     loader = MT5DataLoader()
@@ -499,8 +539,17 @@ def main(argv=None):
     with open(out_summary_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    if meta_state is not None:
-        save_json(args.meta_risk_out, meta_state)
+    if meta_state is not None and meta_persist:
+        saved = False
+        try:
+            saved = meta_state.save_json(meta_state_out)
+        except Exception as e:
+            print(f"[meta_risk] warn failed to save state to {meta_state_out}: {e}")
+            saved = False
+        if saved:
+            print(f"[meta_risk] saved state to {meta_state_out}")
+        else:
+            print(f"[meta_risk] warn failed to save state to {meta_state_out}")
 
     print("Model:", mode, model_path)
     print("Weighter:", weighter.cfg)
