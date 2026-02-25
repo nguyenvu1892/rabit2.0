@@ -85,6 +85,11 @@ class MetaRiskConfig:
     target_pf: float
     target_return: float
     dd_soft_limit: float
+    global_min_scale: float
+    global_max_scale: float
+    global_enter_risk_off: float
+    global_exit_risk_off: float
+    global_cooldown_days: int
 
     def __init__(
         self,
@@ -111,6 +116,11 @@ class MetaRiskConfig:
         target_pf: float = 1.02,
         target_return: float = 0.0,
         dd_soft_limit: float = 0.0,
+        global_min_scale: float = 0.6,
+        global_max_scale: float = 1.2,
+        global_enter_risk_off: float = -0.35,
+        global_exit_risk_off: float = -0.10,
+        global_cooldown_days: int = 3,
     ) -> None:
         if alpha is not None:
             ewma_alpha = alpha
@@ -148,6 +158,13 @@ class MetaRiskConfig:
         self.target_pf = float(target_pf)
         self.target_return = float(target_return)
         self.dd_soft_limit = float(dd_soft_limit)
+        self.global_min_scale = float(global_min_scale)
+        self.global_max_scale = float(global_max_scale)
+        if self.global_max_scale < self.global_min_scale:
+            self.global_max_scale = self.global_min_scale
+        self.global_enter_risk_off = float(global_enter_risk_off)
+        self.global_exit_risk_off = float(global_exit_risk_off)
+        self.global_cooldown_days = int(global_cooldown_days)
 
     @property
     def alpha(self) -> float:
@@ -213,6 +230,11 @@ def _normalize_cfg_kwargs(cfg_data: Dict[str, Any]) -> Dict[str, Any]:
         "target_pf",
         "target_return",
         "dd_soft_limit",
+        "global_min_scale",
+        "global_max_scale",
+        "global_enter_risk_off",
+        "global_exit_risk_off",
+        "global_cooldown_days",
         "alpha",
         "floor",
         "cap",
@@ -266,6 +288,24 @@ class MetaRiskState:
         self.last_guard_regime: Optional[str] = None
         self.last_guard_date: Optional[str] = None
         self.last_meta_reason_by_regime: Dict[str, str] = {}
+        self.global_trades: int = 0
+        self.global_pnl_ewm: float = 0.0
+        self.global_abs_pnl_ewm: float = 0.0
+        self.global_winrate_ewm: float = 0.0
+        self.global_dd_ewm: float = 0.0
+        self.global_loss_streak: int = 0
+        self.global_loss_streak_ewm: float = 0.0
+        self.global_equity: float = 0.0
+        self.global_equity_peak: float = 0.0
+        self.global_drawdown: float = 0.0
+        self.global_state: str = "risk_on"
+        self.global_state_change_date: Optional[str] = None
+        self.global_last_risk_off_date: Optional[str] = None
+        self.global_last_state_change_trade_n: int = 0
+        self.global_last_update_ts: Optional[str] = None
+        self.global_last_scale: float = 1.0
+        self.global_last_reason: str = "global_ok"
+        self.global_last_score: float = 0.0
 
     def _set_guard_event(self, regime: str, reason: str) -> None:
         self.last_guard_reason = str(reason) if reason else "ok"
@@ -299,6 +339,18 @@ class MetaRiskState:
             max_scale = min_scale
         return float(min_scale), float(max_scale)
 
+    def _global_scale_bounds(self) -> Tuple[float, float]:
+        min_scale = _safe_float(
+            getattr(self.cfg, "global_min_scale", None),
+            _safe_float(getattr(self.cfg, "global_floor", 0.2), 0.2),
+        )
+        max_scale = _safe_float(getattr(self.cfg, "global_max_scale", None), 1.2)
+        if min_scale <= 0.0:
+            min_scale = _NONZERO_EPS
+        if max_scale < min_scale:
+            max_scale = min_scale
+        return float(min_scale), float(max_scale)
+
     def _fallback_scale(self) -> float:
         min_scale, max_scale = self._scale_bounds()
         fallback = _safe_float(getattr(self.cfg, "global_fallback_scale", 1.0), 1.0)
@@ -320,6 +372,33 @@ class MetaRiskState:
             perf = -1.0
         return float(perf)
 
+    def _performance_score_from_vals(self, pnl: float, abs_pnl: float) -> float:
+        pnl = _safe_float(pnl, 0.0)
+        abs_pnl = _safe_float(abs_pnl, 0.0)
+        if abs_pnl <= 1e-12:
+            return 0.0
+        perf = pnl / (abs_pnl + 1e-12)
+        if perf > 1.0:
+            perf = 1.0
+        if perf < -1.0:
+            perf = -1.0
+        return float(perf)
+
+    def _global_health_score(self) -> float:
+        if _safe_int(getattr(self, "global_trades", 0), 0) <= 0:
+            return 0.0
+        perf = self._performance_score_from_vals(self.global_pnl_ewm, self.global_abs_pnl_ewm)
+        winrate = _safe_float(self.global_winrate_ewm, 0.0)
+        win_score = _clamp((winrate - 0.5) / 0.5, -1.0, 1.0)
+        dd = _safe_float(self.global_dd_ewm, 0.0)
+        denom = max(abs(self.global_pnl_ewm), self.global_abs_pnl_ewm, 1e-6)
+        dd_ratio = _clamp(dd / (denom + 1e-12), 0.0, 1.0)
+        loss_limit = max(1.0, float(_safe_int(getattr(self.cfg, "loss_streak_limit", 5), 5)))
+        loss_ratio = _clamp(self.global_loss_streak_ewm / loss_limit, 0.0, 1.0)
+
+        score = 0.55 * perf + 0.30 * win_score - 0.15 * dd_ratio - 0.10 * loss_ratio
+        return _clamp(score, -1.0, 1.0)
+
     def _apply_dd_soft_limit(self, scale: float) -> float:
         limit = _safe_float(getattr(self.cfg, "dd_soft_limit", 0.0), 0.0)
         if limit <= 0.0:
@@ -333,6 +412,73 @@ class MetaRiskState:
         scale = scale * (1.0 - penalty)
         min_scale, max_scale = self._scale_bounds()
         return _clamp(scale, min_scale, max_scale)
+
+    def _global_cooldown_elapsed(self, date_key: Optional[str]) -> bool:
+        cooldown_days = max(0, _safe_int(getattr(self.cfg, "global_cooldown_days", 0), 0))
+        if cooldown_days <= 0:
+            return True
+        last_date = self.global_last_risk_off_date
+        if not last_date or not date_key:
+            return True
+        last_ord = _date_ordinal(last_date)
+        cur_ord = _date_ordinal(date_key)
+        if last_ord is None or cur_ord is None:
+            return True
+        return (cur_ord - last_ord) >= cooldown_days
+
+    def _update_global_state(self, date_key: Optional[str]) -> None:
+        enter = _safe_float(getattr(self.cfg, "global_enter_risk_off", -0.35), -0.35)
+        exit = _safe_float(getattr(self.cfg, "global_exit_risk_off", -0.10), -0.10)
+        if exit < enter:
+            exit = enter
+        score = self._global_health_score()
+        self.global_last_score = score
+
+        if self.global_state != "risk_off":
+            if score <= enter:
+                self.global_state = "risk_off"
+                self.global_state_change_date = date_key
+                self.global_last_risk_off_date = date_key
+                self.global_last_state_change_trade_n = _safe_int(self.global_trades, 0)
+        else:
+            if self._global_cooldown_elapsed(date_key) and score >= exit:
+                self.global_state = "risk_on"
+                self.global_state_change_date = date_key
+                self.global_last_state_change_trade_n = _safe_int(self.global_trades, 0)
+
+    def global_scale_with_reason(self, update_state: bool = False) -> Tuple[float, str]:
+        min_scale, max_scale = self._global_scale_bounds()
+        if _safe_int(getattr(self, "global_trades", 0), 0) <= 0:
+            return 1.0, "global_fallback_no_trades"
+
+        score = self._global_health_score()
+        down_power = max(0.01, _safe_float(getattr(self.cfg, "down_power", 1.0), 1.0))
+        up_power = max(0.01, _safe_float(getattr(self.cfg, "up_power", 1.0), 1.0))
+
+        if self.global_state == "risk_off":
+            scale = min_scale
+            reason = "global_risk_off"
+        else:
+            if score < 0.0:
+                scale = 1.0 - (abs(score) ** down_power) * (1.0 - min_scale)
+                reason = "global_down"
+            elif score > 0.0:
+                scale = 1.0 + (score ** up_power) * (max_scale - 1.0)
+                reason = "global_up"
+            else:
+                scale = 1.0
+                reason = "global_ok"
+
+        scale = _clamp(scale, min_scale, max_scale)
+        if update_state:
+            self.global_last_scale = scale
+            self.global_last_reason = reason
+            self.global_last_score = score
+        return scale, reason
+
+    def global_scale(self) -> float:
+        scale, _reason = self.global_scale_with_reason(update_state=False)
+        return float(scale)
 
     def _scale_from_stats(self, st: RegimeStats) -> float:
         min_scale, max_scale = self._scale_bounds()
@@ -383,6 +529,34 @@ class MetaRiskState:
             st.last_meta_reason = reason
         return candidate, reason
 
+    def _update_global_metrics(self, pnl_value: float, ts_norm: str, date_key: Optional[str]) -> None:
+        alpha = float(self.cfg.ewma_alpha)
+        self.global_trades = _safe_int(self.global_trades, 0) + 1
+
+        self.global_pnl_ewm = (1.0 - alpha) * self.global_pnl_ewm + alpha * pnl_value
+        self.global_abs_pnl_ewm = (1.0 - alpha) * self.global_abs_pnl_ewm + alpha * abs(pnl_value)
+        win = 1.0 if pnl_value > 0.0 else 0.0
+        self.global_winrate_ewm = (1.0 - alpha) * self.global_winrate_ewm + alpha * win
+
+        if pnl_value > 0.0:
+            self.global_loss_streak = 0
+        else:
+            self.global_loss_streak = _safe_int(self.global_loss_streak, 0) + 1
+        self.global_loss_streak_ewm = (1.0 - alpha) * self.global_loss_streak_ewm + alpha * self.global_loss_streak
+
+        self.global_equity += pnl_value
+        if self.global_equity_peak == 0.0 and self.global_drawdown == 0.0:
+            self.global_equity_peak = self.global_equity
+        self.global_equity_peak = max(self.global_equity_peak, self.global_equity)
+        dd_now = self.global_equity_peak - self.global_equity
+        self.global_drawdown = dd_now
+        self.global_dd_ewm = (1.0 - alpha) * self.global_dd_ewm + alpha * dd_now
+
+        if ts_norm:
+            self.global_last_update_ts = ts_norm
+        elif date_key:
+            self.global_last_update_ts = str(date_key)
+
     def update_trade(
         self,
         regime: str,
@@ -424,6 +598,9 @@ class MetaRiskState:
         date_key = _extract_date_key(ts_norm or date)
         if date_key is not None:
             self.daily_date = date_key
+
+        self._update_global_metrics(pnl_value, ts_norm, date_key)
+        self._update_global_state(date_key)
 
         if pnl_value > 0.0:
             self.loss_streak = 0
@@ -503,7 +680,13 @@ class MetaRiskState:
     def meta_scale_with_reason(self, regime: str, update_state: bool = False) -> Tuple[float, str]:
         regime_key = _normalize_regime(regime)
         st = self.regimes.get(regime_key)
-        scale, reason = self._compute_scale(regime_key, st, update_state)
+        regime_scale, regime_reason = self._compute_scale(regime_key, st, update_state)
+        global_scale, global_reason = self.global_scale_with_reason(update_state=update_state)
+        min_scale, max_scale = self._scale_bounds()
+        scale = _clamp(regime_scale * global_scale, min_scale, max_scale)
+        reason = regime_reason
+        if global_reason and global_reason != "global_ok":
+            reason = f"{regime_reason}|{global_reason}"
         if regime_key:
             self.last_meta_reason_by_regime[regime_key] = reason
             if st is not None and st.last_meta_reason is None:
@@ -514,9 +697,30 @@ class MetaRiskState:
         """
         Return a risk scaling factor in [scale_min, scale_max].
         Warmup: if not enough trades yet -> return fallback scale (no interference).
+        Applies regime scale * global scale with clamp.
         """
         scale, _reason = self.meta_scale_with_reason(regime, update_state=False)
         return scale
+
+    def global_metrics_snapshot(self) -> Dict[str, Any]:
+        return {
+            "global_trades": int(_safe_int(self.global_trades, 0)),
+            "global_pnl_ewm": float(_safe_float(self.global_pnl_ewm, 0.0)),
+            "global_abs_pnl_ewm": float(_safe_float(self.global_abs_pnl_ewm, 0.0)),
+            "global_winrate_ewm": float(_safe_float(self.global_winrate_ewm, 0.0)),
+            "global_dd_ewm": float(_safe_float(self.global_dd_ewm, 0.0)),
+            "global_loss_streak": int(_safe_int(self.global_loss_streak, 0)),
+            "global_loss_streak_ewm": float(_safe_float(self.global_loss_streak_ewm, 0.0)),
+            "global_equity": float(_safe_float(self.global_equity, 0.0)),
+            "global_equity_peak": float(_safe_float(self.global_equity_peak, 0.0)),
+            "global_drawdown": float(_safe_float(self.global_drawdown, 0.0)),
+            "global_state": str(self.global_state or "risk_on"),
+            "global_state_change_date": _normalize_optional_ts(self.global_state_change_date),
+            "global_last_risk_off_date": _normalize_optional_ts(self.global_last_risk_off_date),
+            "global_last_scale": float(_safe_float(self.global_last_scale, 1.0)),
+            "global_last_reason": str(self.global_last_reason or "global_ok"),
+            "global_last_score": float(_safe_float(self.global_last_score, 0.0)),
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         regimes_out: Dict[str, Dict[str, Any]] = {}
@@ -563,6 +767,24 @@ class MetaRiskState:
             "last_guard_regime": str(self.last_guard_regime) if self.last_guard_regime is not None else None,
             "last_guard_date": _normalize_optional_ts(self.last_guard_date),
             "last_meta_reason_by_regime": last_meta,
+            "global_trades": int(_safe_int(self.global_trades, 0)),
+            "global_pnl_ewm": float(_safe_float(self.global_pnl_ewm, 0.0)),
+            "global_abs_pnl_ewm": float(_safe_float(self.global_abs_pnl_ewm, 0.0)),
+            "global_winrate_ewm": float(_safe_float(self.global_winrate_ewm, 0.0)),
+            "global_dd_ewm": float(_safe_float(self.global_dd_ewm, 0.0)),
+            "global_loss_streak": int(_safe_int(self.global_loss_streak, 0)),
+            "global_loss_streak_ewm": float(_safe_float(self.global_loss_streak_ewm, 0.0)),
+            "global_equity": float(_safe_float(self.global_equity, 0.0)),
+            "global_equity_peak": float(_safe_float(self.global_equity_peak, 0.0)),
+            "global_drawdown": float(_safe_float(self.global_drawdown, 0.0)),
+            "global_state": str(self.global_state or "risk_on"),
+            "global_state_change_date": _normalize_optional_ts(self.global_state_change_date),
+            "global_last_risk_off_date": _normalize_optional_ts(self.global_last_risk_off_date),
+            "global_last_state_change_trade_n": int(_safe_int(self.global_last_state_change_trade_n, 0)),
+            "global_last_update_ts": _normalize_optional_ts(self.global_last_update_ts),
+            "global_last_scale": float(_safe_float(self.global_last_scale, 1.0)),
+            "global_last_reason": str(self.global_last_reason or "global_ok"),
+            "global_last_score": float(_safe_float(self.global_last_score, 0.0)),
         }
 
     def to_json_dict(self) -> Dict[str, Any]:
@@ -635,6 +857,54 @@ class MetaRiskState:
             }
         else:
             state.last_meta_reason_by_regime = {}
+        global_data = data.get("global", {})
+        if not isinstance(global_data, dict):
+            global_data = {}
+
+        state.global_trades = _safe_int(data.get("global_trades", global_data.get("global_trades", 0)), 0)
+        state.global_pnl_ewm = _safe_float(data.get("global_pnl_ewm", global_data.get("global_pnl_ewm", 0.0)), 0.0)
+        state.global_abs_pnl_ewm = _safe_float(
+            data.get("global_abs_pnl_ewm", global_data.get("global_abs_pnl_ewm", 0.0)), 0.0
+        )
+        state.global_winrate_ewm = _safe_float(
+            data.get("global_winrate_ewm", global_data.get("global_winrate_ewm", 0.0)), 0.0
+        )
+        state.global_dd_ewm = _safe_float(data.get("global_dd_ewm", global_data.get("global_dd_ewm", 0.0)), 0.0)
+        state.global_loss_streak = _safe_int(
+            data.get("global_loss_streak", global_data.get("global_loss_streak", 0)), 0
+        )
+        state.global_loss_streak_ewm = _safe_float(
+            data.get("global_loss_streak_ewm", global_data.get("global_loss_streak_ewm", 0.0)), 0.0
+        )
+        state.global_equity = _safe_float(data.get("global_equity", global_data.get("global_equity", 0.0)), 0.0)
+        state.global_equity_peak = _safe_float(
+            data.get("global_equity_peak", global_data.get("global_equity_peak", 0.0)), 0.0
+        )
+        state.global_drawdown = _safe_float(
+            data.get("global_drawdown", global_data.get("global_drawdown", 0.0)), 0.0
+        )
+        state.global_state = str(data.get("global_state", global_data.get("global_state", "risk_on")) or "risk_on")
+        state.global_state_change_date = _normalize_optional_ts(
+            data.get("global_state_change_date", global_data.get("global_state_change_date"))
+        )
+        state.global_last_risk_off_date = _normalize_optional_ts(
+            data.get("global_last_risk_off_date", global_data.get("global_last_risk_off_date"))
+        )
+        state.global_last_state_change_trade_n = _safe_int(
+            data.get("global_last_state_change_trade_n", global_data.get("global_last_state_change_trade_n", 0)), 0
+        )
+        state.global_last_update_ts = _normalize_optional_ts(
+            data.get("global_last_update_ts", global_data.get("global_last_update_ts"))
+        )
+        state.global_last_scale = _safe_float(
+            data.get("global_last_scale", global_data.get("global_last_scale", 1.0)), 1.0
+        )
+        state.global_last_reason = str(
+            data.get("global_last_reason", global_data.get("global_last_reason", "global_ok")) or "global_ok"
+        )
+        state.global_last_score = _safe_float(
+            data.get("global_last_score", global_data.get("global_last_score", 0.0)), 0.0
+        )
         return state
 
     @classmethod
