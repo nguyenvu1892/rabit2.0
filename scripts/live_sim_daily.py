@@ -331,6 +331,14 @@ def main():
 
             # make action (default HOLD)
             action = (0, 0.8, 0.8, 20)
+            size_conf = 0.0
+            base_size = 0.0
+            meta_scale = 1.0
+            size_pre_guard = 0.0
+            size_pre_guard_vol = 0.0
+            size_final = 0.0
+            guard_reason = "ok"
+            vol_scale = 1.0
 
             # warmup
             if i >= warmup_bars and (not dd_stop) and (loss_streak < max_loss_streak) and (not spike_block):
@@ -348,7 +356,13 @@ def main():
                     # confidence -> size
                     feat_row = feat.iloc[i]
                     confidence, _allow, _reason = gate.evaluate(feat_row)
-                    base_size = float(weighter.size(confidence))
+                    size_conf = float(weighter.size(confidence))
+                    base_size = size_conf
+
+                    meta_scale = 1.0
+                    if meta_state is not None:
+                        meta_scale = float(meta_state.meta_scale(regime))
+                    size_pre_guard = float(size_conf * meta_scale)
 
                     # volatility scaling
                     atr_i = float(df_env.iloc[i]["atr"])
@@ -359,12 +373,15 @@ def main():
                     vol_scale = tatr_i / atr_i
                     vol_scale = float(np.clip(vol_scale, min_vol_scale, max_vol_scale))
 
-                    final_size = base_size * vol_scale
+                    size_pre_guard_vol = float(size_pre_guard * vol_scale)
+                    size_final = size_pre_guard_vol
                     if meta_state is not None:
-                        final_size = meta_state.apply_guardrails(regime, float(final_size))
+                        size_final = meta_state.apply_guardrails(regime, float(size_pre_guard_vol))
+                        guard_reason = meta_state.get_guard_reason(regime)
+                    size_final = float(np.clip(size_final, 0.0, 1.0))
 
-                    if final_size > 1e-6:
-                        action = (dir_, float(tp_mult), float(sl_mult), int(hold_max), float(final_size))
+                    if size_final > 1e-6:
+                        action = (dir_, float(tp_mult), float(sl_mult), int(hold_max), float(size_final))
 
             # step env
             env.step(i, action)
@@ -395,8 +412,13 @@ def main():
                 "loss_streak": int(loss_streak),
                 "spread": int(spread_pts),
                 "regime": str(regime_arr[i]) if regime_arr is not None else "na",
-                "vol_scale": float(vol_scale) if "vol_scale" in locals() else 1.0,
-                "base_size": float(base_size) if "base_size" in locals() else 0.0,
+                "vol_scale": float(vol_scale),
+                "base_size": float(base_size),
+                "size_conf": float(size_conf),
+                "meta_scale": float(meta_scale),
+                "size_pre_guard": float(size_pre_guard),
+                "size": float(size_final),
+                "guard_reason": str(guard_reason),
             })
 
         # day summary

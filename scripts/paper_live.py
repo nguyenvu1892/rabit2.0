@@ -447,6 +447,8 @@ def main():
         action = {
             "dir": 0, "tp_mult": 0.0, "sl_mult": 0.0, "hold_max": 0,
             "confidence": 0.0, "base_size": 0.0, "vol_scale": 1.0, "final_size": 0.0,
+            "size_conf": 0.0, "meta_scale": 1.0, "size_pre_guard": 0.0, "size": 0.0,
+            "guard_reason": "ok",
             "allow": False, "reason": "hold"
         }
 
@@ -461,13 +463,22 @@ def main():
             feat_row = feat.iloc[i]
             confidence, allow_trade, reason = gate.evaluate(feat_row)
 
-            base_size = float(weighter.size(confidence))
+            size_conf = float(weighter.size(confidence))
+            base_size = size_conf
+            meta_scale = 1.0
+            if meta_state is not None:
+                meta_scale = float(meta_state.meta_scale(regime))
+            size_pre_guard = float(size_conf * meta_scale)
             atr_use = max(cfg.atr_floor, float(atr_i))
             tatr_use = max(cfg.atr_floor, float(tatr_i))
             vol_scale = float(np.clip(tatr_use / atr_use, cfg.min_vol_scale, cfg.max_vol_scale))
-            final_size = float(base_size * vol_scale)
+            size_pre_guard_vol = float(size_pre_guard * vol_scale)
+            final_size = float(size_pre_guard_vol)
+            guard_reason = "ok"
             if meta_state is not None:
-                final_size = meta_state.apply_guardrails(regime, final_size)
+                final_size = meta_state.apply_guardrails(regime, size_pre_guard_vol)
+                guard_reason = meta_state.get_guard_reason(regime)
+            final_size = float(np.clip(final_size, 0.0, 1.0))
 
             if allow_trade and dir_ != 0 and final_size > 1e-6:
                 action.update({
@@ -479,6 +490,11 @@ def main():
                     "base_size": float(base_size),
                     "vol_scale": float(vol_scale),
                     "final_size": float(final_size),
+                    "size_conf": float(size_conf),
+                    "meta_scale": float(meta_scale),
+                    "size_pre_guard": float(size_pre_guard),
+                    "size": float(final_size),
+                    "guard_reason": str(guard_reason),
                     "allow": True,
                     "reason": str(reason),
                 })

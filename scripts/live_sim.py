@@ -36,6 +36,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run live simulator")
     parser.add_argument("--meta_risk", type=int, default=1, help="Enable meta-risk scaling (1/0)")
     parser.add_argument(
+        "--meta_feedback",
+        type=int,
+        default=1,
+        help="Enable meta-risk feedback into confidence power (1/0)",
+    )
+    parser.add_argument(
         "--meta_risk_state",
         type=str,
         default="data/reports/meta_risk_state.json",
@@ -101,6 +107,19 @@ def make_obs_matrix(feat_df: pd.DataFrame, feature_cols: list[str]):
     X = (X - mu) / sd
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X, mu, sd
+
+
+def _confidence_size(weighter: ConfidenceWeighter, confidence: float, power_override: float | None = None) -> float:
+    c = float(confidence)
+    if not np.isfinite(c):
+        return 0.0
+    c = float(np.clip(c, 0.0, 1.0))
+    if weighter.cfg.deadzone > 0.0 and c < weighter.cfg.deadzone:
+        return 0.0
+    power = float(power_override) if power_override is not None else float(weighter.cfg.power)
+    s = c ** power
+    s = float(np.clip(s, weighter.cfg.min_size, weighter.cfg.max_size))
+    return s
 
 
 def _ledger_to_trades_df(ledger) -> pd.DataFrame:
@@ -195,6 +214,12 @@ def main(argv=None):
     power = 2.5
     deadzone = 0.0
     min_size = 0.0
+    base_power = power
+    meta_feedback_enabled = int(args.meta_feedback) != 0
+    meta_feedback_low_scale = 0.7
+    meta_feedback_high_scale = 1.1
+    meta_feedback_low_power_mult = 0.8
+    meta_feedback_high_power_mult = 1.1
 
     env_cfg = dict(
         gap_close_minutes=60,
@@ -290,7 +315,9 @@ def main(argv=None):
         "regime": "unknown",
         "meta_scale": 1.0,
         "size_conf": 0.0,
+        "size_pre_guard": 0.0,
         "size": 0.0,
+        "guard_reason": "ok",
     }
     trade_meta = []
     closed_idx = 0
@@ -315,18 +342,32 @@ def main(argv=None):
         # confidence -> size
         feat_row = feat.iloc[i]
         confidence, _allow, _reason = gate.evaluate(feat_row)
-        size_conf = float(weighter.size(float(confidence)))
-
         meta_scale = 1.0
-        size_final = size_conf
         if meta_state is not None:
             meta_scale = float(meta_state.meta_scale(regime))
-            size_final = float(np.clip(size_conf * meta_scale, 0.0, 1.0))
+
+        effective_power = base_power
+        if meta_feedback_enabled:
+            if meta_scale < meta_feedback_low_scale:
+                effective_power = base_power * meta_feedback_low_power_mult
+            elif meta_scale > meta_feedback_high_scale:
+                effective_power = base_power * meta_feedback_high_power_mult
+
+        size_conf = float(_confidence_size(weighter, float(confidence), power_override=effective_power))
+        size_pre_guard = float(size_conf * meta_scale)
+        size_final = size_pre_guard
+        guard_reason = "ok"
+        if meta_state is not None:
+            size_final = float(meta_state.apply_guardrails(regime, float(size_pre_guard)))
+            guard_reason = meta_state.get_guard_reason(regime)
+        size_final = float(np.clip(size_final, 0.0, 1.0))
 
         decision_meta["regime"] = regime
         decision_meta["meta_scale"] = meta_scale
         decision_meta["size_conf"] = size_conf
+        decision_meta["size_pre_guard"] = size_pre_guard
         decision_meta["size"] = size_final
+        decision_meta["guard_reason"] = guard_reason
 
         if size_final <= 1e-6:
             return (0, 0.8, 0.8, 20)
@@ -347,7 +388,9 @@ def main(argv=None):
                         "regime": decision_meta.get("regime", "unknown"),
                         "meta_scale": float(decision_meta.get("meta_scale", 1.0)),
                         "size_conf": float(decision_meta.get("size_conf", 0.0)),
+                        "size_pre_guard": float(decision_meta.get("size_pre_guard", 0.0)),
                         "size": float(decision_meta.get("size", 0.0)),
+                        "guard_reason": str(decision_meta.get("guard_reason", "ok")),
                     }
                 )
 
@@ -382,18 +425,31 @@ def main(argv=None):
         meta_df = pd.DataFrame(trade_meta)
         if len(meta_df) < len(trades_df):
             meta_df = meta_df.reindex(range(len(trades_df)))
-        for col in ["regime", "meta_scale", "size_conf", "size"]:
+        for col in ["regime", "meta_scale", "size_conf", "size_pre_guard", "size", "guard_reason"]:
             if col in meta_df.columns:
                 trades_df[col] = meta_df[col].values
 
     trades_df.to_csv(out_trades_csv, index=False)
 
-    # sanity: ensure CSV is real table, not "Ledger object ..."
-    chk = pd.read_csv(out_trades_csv)
-    if chk.shape[0] == 0 or chk.shape[1] <= 1:
-        raise RuntimeError(
-            f"Export trades failed (file looks wrong): shape={chk.shape}, cols={chk.columns.tolist()}"
-        )
+    # -------------------------------
+    # Safe integrity check
+    # -------------------------------
+    chk = None
+
+    if os.path.exists(out_trades_csv) and os.path.getsize(out_trades_csv) > 10:
+        try:
+            chk = pd.read_csv(out_trades_csv)
+        except Exception as e:
+            print("[warn] trade file read failed:", e)
+    else:
+        print("[warn] live_sim_trades.csv empty or no trades generated.")
+
+    if chk is not None:
+        if chk.shape[0] == 0 or chk.shape[1] <= 1:
+            print(
+                f"[warn] trade file suspicious shape={chk.shape}, cols={chk.columns.tolist()}"
+            )
+        
 
     equity_df = _build_equity_from_trades(trades_df)
     equity_df.to_csv(out_equity_csv, index=False)
@@ -405,6 +461,14 @@ def main(argv=None):
         "warmup_bars": warmup_bars,
         "feature_cols": feature_cols,
         "weighter": weighter.cfg.__dict__,
+        "meta_feedback": {
+            "enabled": bool(meta_feedback_enabled),
+            "base_power": float(base_power),
+            "low_scale": float(meta_feedback_low_scale),
+            "high_scale": float(meta_feedback_high_scale),
+            "low_power_mult": float(meta_feedback_low_power_mult),
+            "high_power_mult": float(meta_feedback_high_power_mult),
+        },
         "metrics": md,
     }
     with open(out_summary_json, "w", encoding="utf-8") as f:

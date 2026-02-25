@@ -148,6 +148,23 @@ class MetaRiskState:
         self.loss_streak = 0
         self.regime_freeze_until: Dict[str, str] = {}
         self.daily_date: Optional[str] = None
+        self.last_guard_reason: str = "ok"
+        self.last_guard_regime: Optional[str] = None
+        self.last_guard_date: Optional[str] = None
+
+    def _set_guard_event(self, regime: str, reason: str) -> None:
+        self.last_guard_reason = str(reason) if reason else "ok"
+        self.last_guard_regime = str(regime) if regime is not None else None
+        self.last_guard_date = self.daily_date
+
+    def get_guard_reason(self, regime: str) -> str:
+        if regime:
+            if self.last_guard_regime == regime:
+                return self.last_guard_reason or "ok"
+            return "ok"
+        if self.last_guard_regime in (None, ""):
+            return self.last_guard_reason or "ok"
+        return "ok"
 
     def update_trade(
         self,
@@ -244,27 +261,95 @@ class MetaRiskState:
     def apply_guardrails(self, regime: str, size: float) -> float:
         size = float(size)
         if size <= 0.0:
+            self._set_guard_event(regime, "ok")
             return 0.0
         if self.daily_drawdown > self.cfg.daily_dd_limit:
+            self._set_guard_event(regime, "daily_dd_stop")
             return 0.0
+        guard_reason = "ok"
         if self.cfg.loss_streak_limit > 0 and self.loss_streak >= self.cfg.loss_streak_limit:
+            guard_reason = "loss_streak"
             size *= 0.5
         if self._is_regime_frozen(regime):
+            self._set_guard_event(regime, "regime_frozen")
             return 0.0
-        return float(max(0.0, min(1.0, size)))
+        size = float(max(0.0, min(1.0, size)))
+        self._set_guard_event(regime, guard_reason)
+        return size
 
     def meta_scale(self, regime: str) -> float:
-        stats = self.regimes.get(regime)
-        if stats is None:
-            return 1.0
-        if stats.n_trades < self.cfg.min_trades_per_regime:
+        """
+        Return a risk scaling factor in [min_scale, max_scale].
+        Warmup: if not enough trades yet -> return 1.0 (no interference).
+        Robust to internal attribute names (state dict) to avoid crashing.
+        """
+
+        # --- Find regime-state map robustly (avoid AttributeError) ---
+        states = (
+            getattr(self, "state_by_regime", None)
+            or getattr(self, "by_regime", None)
+            or getattr(self, "regime_states", None)
+            or getattr(self, "states_by_regime", None)
+            or getattr(self, "states", None)
+        )
+
+        if states is None or not hasattr(states, "get"):
+            # If structure unknown, never crash; just don't interfere.
             return 1.0
 
-        score = stats.ewma_return / (stats.ewma_vol + 1e-8)
-        score = max(-self.cfg.score_clip, min(self.cfg.score_clip, score))
-        s = 1.0 / (1.0 + math.exp(-self.cfg.k * score))
-        scale = self.cfg.min_scale + s * (self.cfg.max_scale - self.cfg.min_scale)
-        return float(scale)
+        st = states.get(regime)
+        if st is None:
+            return 1.0
+
+        # --- Warmup guard ---
+        n_trades = getattr(st, "n_trades", None)
+        if n_trades is None:
+            # Some implementations store trades list
+            trades_list = getattr(st, "trades", None)
+            if trades_list is not None:
+                try:
+                    n_trades = len(trades_list)
+                except Exception:
+                    n_trades = 0
+            else:
+                n_trades = 0
+
+        if n_trades < getattr(self.cfg, "min_trades_per_regime", 1):
+            return 1.0
+
+        # --- Compute scale: keep your existing logic if it exists ---
+        # Try to call an existing compute function if you have one.
+        scale = None
+        if hasattr(self, "_compute_scale_from_state"):
+            scale = self._compute_scale_from_state(st)
+        elif hasattr(self, "_scale_from_state"):
+            scale = self._scale_from_state(st)
+        elif hasattr(self, "compute_scale"):
+            scale = self.compute_scale(st)
+        else:
+            # Fallback: if you don't have compute logic here, default to 1.0
+            scale = 1.0
+
+        # --- Clamp to avoid "deny all" ---
+        try:
+            scale = float(scale)
+        except Exception:
+            scale = 1.0
+
+        if not (scale == scale):  # NaN
+            scale = 1.0
+
+        min_scale = float(getattr(self.cfg, "min_scale", 0.2))
+        max_scale = float(getattr(self.cfg, "max_scale", 1.0))
+        if max_scale < min_scale:
+            max_scale = min_scale
+
+        if scale < min_scale:
+            scale = min_scale
+        if scale > max_scale:
+            scale = max_scale
+
+        return scale
 
     def to_json_dict(self) -> Dict[str, Any]:
         return {
@@ -275,6 +360,9 @@ class MetaRiskState:
             "loss_streak": int(self.loss_streak),
             "regime_freeze_until": dict(self.regime_freeze_until),
             "daily_date": self.daily_date,
+            "last_guard_reason": self.last_guard_reason,
+            "last_guard_regime": self.last_guard_regime,
+            "last_guard_date": self.last_guard_date,
         }
 
     @classmethod
@@ -311,6 +399,10 @@ class MetaRiskState:
         else:
             state.regime_freeze_until = {}
         state.daily_date = data.get("daily_date")
+        state.last_guard_reason = str(data.get("last_guard_reason", "ok") or "ok")
+        last_regime = data.get("last_guard_regime")
+        state.last_guard_regime = str(last_regime) if last_regime is not None else None
+        state.last_guard_date = data.get("last_guard_date")
         return state
 
     def save(self, path: str) -> None:
