@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import re
 import json
 import argparse
 from typing import Any, Dict, Optional, Tuple, List
@@ -56,6 +57,51 @@ _EQUITY_COLUMNS = [
     "intraday_dd",
     "dd_stop",
     "end_loss_streak",
+]
+
+_MT5_TRADE_COLUMNS = [
+    "ts",
+    "symbol",
+    "timeframe",
+    "action",
+    "size",
+    "entry_price",
+    "sl",
+    "tp",
+    "hold_bars",
+    "hold_minutes",
+    "regime",
+    "meta_scale",
+    "size_conf",
+    "meta_reason",
+    "guard_reason",
+    "model_path",
+    "power",
+    "seed",
+    "spread_open_cap",
+    "spread_spike_cap",
+    "enable_london",
+    "enable_ny",
+    "london_start",
+    "london_end",
+    "ny_start",
+    "ny_end",
+    "no_session_filter",
+    "no_spread_filter",
+]
+
+_MT5_DECISION_COLUMNS = [
+    "ts",
+    "action",
+    "raw_size",
+    "final_size",
+    "regime",
+    "meta_scale",
+    "size_conf",
+    "confidence",
+    "spread",
+    "session_ok",
+    "guardrail_ok",
 ]
 
 
@@ -717,6 +763,8 @@ def run_one_day(
     bypass_session: bool = False,
     bypass_spread: bool = False,
     debug: bool = False,
+    collect_decisions: bool = False,
+    collect_trade_meta: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float, Dict[str, Any]]:
     if legacy_features:
         atr_series = build_atr_series(df_day, period=int(cfg.get("atr_period", 14)))
@@ -779,6 +827,10 @@ def run_one_day(
         "size_zero": 0,
     }
 
+    decision_rows: Optional[List[Dict[str, Any]]] = [] if collect_decisions else None
+    trade_meta: Optional[List[Dict[str, Any]]] = [] if collect_trade_meta else None
+    last_decision_meta: Dict[str, Any] = {}
+
     loss_streak = 0
     dd_stop = False
     equity_start = global_balance
@@ -795,8 +847,13 @@ def run_one_day(
         except Exception:
             return True
 
+    def _record_decision(payload: Dict[str, Any]) -> None:
+        if decision_rows is None:
+            return
+        decision_rows.append(payload)
+
     def policy_func(i: int):
-        nonlocal loss_streak, dd_stop, equity_peak, equity_min
+        nonlocal loss_streak, dd_stop, equity_peak, equity_min, last_decision_meta
 
         if isinstance(i, (int, np.integer)):
             row = df_day.iloc[int(i)]
@@ -841,10 +898,16 @@ def run_one_day(
             size_conf = float(weighter.size(float(raw_conf)))
         allow = size_conf > 0.0
 
+        regime = info.get("regime", "unknown") if isinstance(info, dict) else "unknown"
+
         meta_scale = 1.0
+        meta_reason = None
         if meta_state is not None:
-            regime = info.get("regime", "unknown") if isinstance(info, dict) else "unknown"
-            meta_scale = float(meta_state.meta_scale(regime))
+            try:
+                meta_scale, meta_reason = meta_state.meta_scale_with_reason(regime, update_state=False)
+            except Exception:
+                meta_scale = float(meta_state.meta_scale(regime))
+                meta_reason = None
 
         final_size = size_conf * meta_scale
 
@@ -855,6 +918,61 @@ def run_one_day(
 
         if intraday_dd >= daily_dd_limit:
             dd_stop = True
+
+        guardrails_ok = allow and (not dd_stop) and (loss_streak < max_loss_streak)
+        guard_reason = "ok"
+        if int(direction) == 0:
+            guard_reason = "policy_hold"
+        elif not allow:
+            guard_reason = "size_zero"
+        elif dd_stop:
+            guard_reason = "dd_stop"
+        elif loss_streak >= max_loss_streak:
+            guard_reason = "loss_streak"
+        elif not session_ok:
+            guard_reason = "session_closed"
+        elif not spread_open_ok:
+            guard_reason = "spread_open_cap"
+        elif not spread_spike_ok:
+            guard_reason = "spread_spike_cap"
+
+        decision_action = "HOLD"
+        exec_size = 0.0
+        if int(direction) != 0 and guardrails_ok and session_ok and spread_open_ok and spread_spike_ok:
+            if float(direction) > 0:
+                decision_action = "BUY"
+            else:
+                decision_action = "SELL"
+            exec_size = float(np.clip(final_size, 0.0, 1.0))
+
+        _record_decision(
+            {
+                "ts": parse_ts(ts).isoformat() if ts is not None else None,
+                "action": decision_action,
+                "raw_size": float(size_conf),
+                "final_size": float(exec_size),
+                "regime": str(regime),
+                "meta_scale": float(meta_scale),
+                "size_conf": float(size_conf),
+                "confidence": float(raw_conf),
+                "spread": int(spread_points),
+                "session_ok": bool(session_ok),
+                "guardrail_ok": bool(guardrails_ok),
+                "meta_reason": str(meta_reason) if meta_reason is not None else None,
+                "guard_reason": str(guard_reason) if guard_reason else None,
+            }
+        )
+
+        last_decision_meta = {
+            "regime": str(regime),
+            "meta_scale": float(meta_scale),
+            "meta_reason": str(meta_reason) if meta_reason is not None else None,
+            "size_conf": float(size_conf),
+            "size": float(exec_size),
+            "final_size": float(exec_size),
+            "guard_reason": str(guard_reason) if guard_reason else None,
+            "hold_bars": 20,
+        }
 
         if int(direction) == 0:
             debug_info["policy_hold"] += 1
@@ -867,7 +985,6 @@ def run_one_day(
             debug_info["pass_spread_open"] += 1
         if spread_spike_ok:
             debug_info["pass_spread_spike"] += 1
-        guardrails_ok = allow and (not dd_stop) and (loss_streak < max_loss_streak)
         if guardrails_ok:
             debug_info["pass_guardrails"] += 1
             debug_info["signals_after_guardrails"] += 1
@@ -902,7 +1019,17 @@ def run_one_day(
 
         return (act_dir, 0.8, 0.8, 20, float(final_size))
 
-    ledger = env.run_backtest(policy_func)
+    for i in range(len(env.df)):
+        prev_trades = len(env.ledger.trades)
+        action = policy_func(env.df.iloc[i])
+        env.step(i, action)
+        if trade_meta is not None:
+            new_trades = len(env.ledger.trades) - prev_trades
+            if new_trades > 0:
+                for _ in range(new_trades):
+                    trade_meta.append(dict(last_decision_meta))
+
+    ledger = env.ledger
 
     trades_df = pd.DataFrame()
     equity_df = pd.DataFrame()
@@ -999,6 +1126,10 @@ def run_one_day(
     debug_info["equity_min"] = float(equity_min)
     debug_info["intraday_dd"] = float(max(0.0, equity_peak - (global_balance + day_pnl)))
     debug_info["regime_counts"] = regime_counts
+    if decision_rows is not None:
+        debug_info["decision_rows"] = decision_rows
+    if trade_meta is not None:
+        debug_info["trade_meta"] = trade_meta
 
     return trades_df, equity_df, day_pnl, debug_info
 
@@ -1075,6 +1206,438 @@ def write_summary_json(path: str, summary: Dict[str, Any]) -> None:
 def write_regime_json(path: str, regime_stats: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(regime_stats, f, ensure_ascii=False, indent=2)
+
+
+def _value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if isinstance(value, float) and np.isnan(value):
+            return False
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if not _value_present(value):
+        return default
+    s = str(value)
+    if not s or s.lower() == "nan":
+        return default
+    return s
+
+
+def _safe_optional_str(value: Any) -> Optional[str]:
+    if not _value_present(value):
+        return None
+    s = str(value)
+    if not s or s.lower() == "nan":
+        return None
+    return s
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    if not _value_present(value):
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
+
+
+def _safe_int_or_none(value: Any) -> Optional[int]:
+    if not _value_present(value):
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _row_get(row: Any, keys: List[str]) -> Any:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        for k in keys:
+            if k in row and _value_present(row.get(k)):
+                return row.get(k)
+            kl = k.lower()
+            if kl in row and _value_present(row.get(kl)):
+                return row.get(kl)
+            ks = k.replace("_", " ")
+            if ks in row and _value_present(row.get(ks)):
+                return row.get(ks)
+            ksl = ks.lower()
+            if ksl in row and _value_present(row.get(ksl)):
+                return row.get(ksl)
+            kn = k.replace("_", "")
+            if kn in row and _value_present(row.get(kn)):
+                return row.get(kn)
+            knl = kn.lower()
+            if knl in row and _value_present(row.get(knl)):
+                return row.get(knl)
+        return None
+    if isinstance(row, pd.Series):
+        for k in keys:
+            if k in row.index and _value_present(row.get(k)):
+                return row.get(k)
+            kl = k.lower()
+            if kl in row.index and _value_present(row.get(kl)):
+                return row.get(kl)
+            ks = k.replace("_", " ")
+            if ks in row.index and _value_present(row.get(ks)):
+                return row.get(ks)
+            ksl = ks.lower()
+            if ksl in row.index and _value_present(row.get(ksl)):
+                return row.get(ksl)
+            kn = k.replace("_", "")
+            if kn in row.index and _value_present(row.get(kn)):
+                return row.get(kn)
+            knl = kn.lower()
+            if knl in row.index and _value_present(row.get(knl)):
+                return row.get(knl)
+    return None
+
+
+def _normalize_action(value: Any) -> Optional[str]:
+    if not _value_present(value):
+        return None
+    if isinstance(value, str):
+        v = value.strip().upper()
+        if v in ("BUY", "LONG", "B", "L"):
+            return "BUY"
+        if v in ("SELL", "SHORT", "S"):
+            return "SELL"
+        if v in ("CLOSE", "EXIT", "C"):
+            return "CLOSE"
+        if v in ("HOLD", "FLAT", "NONE", "0"):
+            return "HOLD"
+    try:
+        iv = int(float(value))
+        if iv == 1:
+            return "BUY"
+        if iv in (-1, 2):
+            return "SELL"
+        if iv == 0:
+            return "HOLD"
+    except Exception:
+        pass
+    try:
+        fv = float(value)
+        if fv > 0:
+            return "BUY"
+        if fv < 0:
+            return "SELL"
+    except Exception:
+        pass
+    return None
+
+
+def _format_ts(value: Any) -> Optional[str]:
+    if not _value_present(value):
+        return None
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.isoformat()
+    except Exception:
+        return _safe_optional_str(value)
+
+
+def _day_start_from_value(value: Any) -> Optional[str]:
+    ts = _format_ts(value)
+    if ts is None:
+        return None
+    try:
+        dt = pd.to_datetime(ts, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.normalize().isoformat()
+    except Exception:
+        return None
+
+
+def _infer_symbol_timeframe_from_path(path: str) -> Tuple[str, str]:
+    base = os.path.basename(path or "")
+    stem, _ext = os.path.splitext(base)
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", stem) if t]
+    symbol = None
+    timeframe = None
+    for t in tokens:
+        ut = t.upper()
+        if timeframe is None and re.match(r"^(M|H|D|W|MN)\\d+$", ut):
+            timeframe = ut
+        if symbol is None and re.match(r"^[A-Z]{3,10}$", ut):
+            if ut not in ("LIVE", "HIST", "DATA", "BARS", "TRADES"):
+                symbol = ut
+    if symbol is None:
+        symbol = "XAUUSD"
+    if timeframe is None:
+        timeframe = "M1"
+    return symbol, timeframe
+
+
+def _build_mt5_provenance(
+    model_path: str,
+    power: float,
+    execution_settings: Dict[str, Any],
+    session_settings: Dict[str, Any],
+    spread_open_cap: float,
+    spread_spike_cap: float,
+    no_session_filter: bool,
+    no_spread_filter: bool,
+) -> Dict[str, Any]:
+    seed = execution_settings.get("seed", 7) if isinstance(execution_settings, dict) else 7
+    return {
+        "model_path": str(model_path),
+        "power": float(power),
+        "seed": int(seed) if _value_present(seed) else 7,
+        "spread_open_cap": float(spread_open_cap),
+        "spread_spike_cap": float(spread_spike_cap),
+        "enable_london": bool(session_settings.get("enable_london", True)),
+        "enable_ny": bool(session_settings.get("enable_ny", True)),
+        "london_start": int(session_settings.get("london_start", 7)),
+        "london_end": int(session_settings.get("london_end", 16)),
+        "ny_start": int(session_settings.get("ny_start", 13)),
+        "ny_end": int(session_settings.get("ny_end", 21)),
+        "no_session_filter": int(bool(no_session_filter)),
+        "no_spread_filter": int(bool(no_spread_filter)),
+    }
+
+
+def _build_mt5_trade_records(
+    trades_df: Optional[pd.DataFrame],
+    trade_meta: Optional[List[Dict[str, Any]]],
+    default_symbol: str,
+    default_timeframe: str,
+    day_start_fallback: Optional[str],
+    provenance: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if trades_df is None or len(trades_df) == 0:
+        return records
+
+    meta_list = trade_meta or []
+
+    for idx, row in trades_df.iterrows():
+        meta = meta_list[idx] if idx < len(meta_list) else {}
+        ts = _format_ts(_row_get(row, ["entry_time", "entry_ts", "open_time", "open_ts", "time", "timestamp", "datetime", "ts"]))
+        if ts is None:
+            ts = _format_ts(_row_get(row, ["exit_time", "exit_ts", "close_time", "close_ts"]))
+        if ts is None:
+            ts = day_start_fallback
+
+        symbol = _safe_str(_row_get(row, ["symbol", "pair", "instrument"]), default_symbol)
+        timeframe = _safe_str(_row_get(row, ["timeframe", "tf"]), default_timeframe)
+
+        action = _normalize_action(_row_get(row, ["action", "side", "direction", "dir"]))
+        if action is None:
+            action = "HOLD"
+
+        size = _safe_float_or_none(_row_get(row, ["size", "final_size", "volume", "qty", "lot", "lots"]))
+        if size is None:
+            size = _safe_float_or_none(meta.get("final_size") if isinstance(meta, dict) else None)
+        if size is None:
+            size = 0.0
+
+        entry_price = _safe_float_or_none(
+            _row_get(row, ["entry_price", "open_price", "price", "entry", "fill_price"])
+        )
+        sl = _safe_float_or_none(
+            _row_get(row, ["sl", "stop_loss", "sl_price", "stop", "stop_price"])
+        )
+        tp = _safe_float_or_none(
+            _row_get(row, ["tp", "take_profit", "tp_price", "target", "target_price"])
+        )
+        hold_bars = _safe_int_or_none(_row_get(row, ["hold_bars", "hold_max"]))
+        if hold_bars is None and isinstance(meta, dict):
+            hold_bars = _safe_int_or_none(meta.get("hold_bars"))
+        hold_minutes = _safe_int_or_none(_row_get(row, ["hold_minutes", "hold_min"]))
+
+        regime = _safe_str(_row_get(row, ["regime", "state"]), "unknown")
+        if isinstance(meta, dict) and _value_present(meta.get("regime")):
+            regime = _safe_str(meta.get("regime"), regime)
+
+        meta_scale = _safe_float_or_none(_row_get(row, ["meta_scale"]))
+        if meta_scale is None and isinstance(meta, dict):
+            meta_scale = _safe_float_or_none(meta.get("meta_scale"))
+        if meta_scale is None:
+            meta_scale = 1.0
+
+        size_conf = _safe_float_or_none(_row_get(row, ["size_conf", "confidence"]))
+        if size_conf is None and isinstance(meta, dict):
+            size_conf = _safe_float_or_none(meta.get("size_conf"))
+
+        meta_reason = None
+        guard_reason = None
+        if isinstance(meta, dict):
+            meta_reason = meta.get("meta_reason")
+            guard_reason = meta.get("guard_reason")
+        if meta_reason is None:
+            meta_reason = _row_get(row, ["meta_reason"])
+        if guard_reason is None:
+            guard_reason = _row_get(row, ["guard_reason"])
+
+        record = {
+            "ts": ts,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "action": action,
+            "size": float(size),
+            "entry_price": entry_price,
+            "sl": sl,
+            "tp": tp,
+            "hold_bars": hold_bars,
+            "hold_minutes": hold_minutes,
+            "regime": regime,
+            "meta_scale": float(meta_scale),
+            "size_conf": size_conf,
+            "meta_reason": _safe_optional_str(meta_reason),
+            "guard_reason": _safe_optional_str(guard_reason),
+        }
+        record.update(provenance)
+        for k in _MT5_TRADE_COLUMNS:
+            if k not in record:
+                record[k] = None
+        records.append(record)
+
+    return records
+
+
+def _build_mt5_decision_records(
+    decisions: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if not decisions:
+        return []
+    records: List[Dict[str, Any]] = []
+    for row in decisions:
+        rec = dict(row) if isinstance(row, dict) else {}
+        if "ts" in rec:
+            rec["ts"] = _format_ts(rec.get("ts"))
+        for k in _MT5_DECISION_COLUMNS:
+            if k not in rec:
+                rec[k] = None
+        records.append(rec)
+    return records
+
+
+def _write_json_lines(path: str, records: List[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _write_csv(path: str, records: List[Dict[str, Any]], columns: List[str]) -> None:
+    if not records:
+        pd.DataFrame(columns=columns).to_csv(path, index=False)
+        return
+    df = pd.DataFrame(records)
+    ordered = columns + [c for c in df.columns if c not in columns]
+    df = df[ordered]
+    df.to_csv(path, index=False)
+
+
+def _write_mt5_export_summary(path: str, summary: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+
+def export_mt5_signals(
+    out_dir: str,
+    trades_df: Optional[pd.DataFrame],
+    trade_meta: Optional[List[Dict[str, Any]]],
+    decisions: Optional[List[Dict[str, Any]]],
+    fmt: str,
+    mode: str,
+    input_csv: str,
+    model_path: str,
+    power: float,
+    execution_settings: Dict[str, Any],
+    session_settings: Dict[str, Any],
+    spread_open_cap: float,
+    spread_spike_cap: float,
+    no_session_filter: bool,
+    no_spread_filter: bool,
+    no_trades_reason: Optional[str] = None,
+    no_decisions_reason: Optional[str] = None,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    ensure_dir(out_dir)
+    fmt_norm = str(fmt or "json").strip().lower()
+    if fmt_norm not in ("json", "csv"):
+        fmt_norm = "json"
+    mode_norm = str(mode or "trades").strip().lower()
+    if mode_norm not in ("trades", "decisions", "both"):
+        mode_norm = "trades"
+
+    default_symbol, default_timeframe = _infer_symbol_timeframe_from_path(input_csv)
+    day_start = None
+    if trades_df is not None and len(trades_df) > 0:
+        ts_guess = _row_get(trades_df.iloc[0], ["entry_time", "exit_time", "time", "timestamp", "datetime", "ts", "day"])
+        day_start = _day_start_from_value(ts_guess)
+
+    provenance = _build_mt5_provenance(
+        model_path=model_path,
+        power=power,
+        execution_settings=execution_settings,
+        session_settings=session_settings,
+        spread_open_cap=spread_open_cap,
+        spread_spike_cap=spread_spike_cap,
+        no_session_filter=no_session_filter,
+        no_spread_filter=no_spread_filter,
+    )
+
+    trades_records: List[Dict[str, Any]] = []
+    decisions_records: List[Dict[str, Any]] = []
+
+    trades_records = _build_mt5_trade_records(
+        trades_df=trades_df,
+        trade_meta=trade_meta,
+        default_symbol=default_symbol,
+        default_timeframe=default_timeframe,
+        day_start_fallback=day_start,
+        provenance=provenance,
+    )
+    trades_path = os.path.join(out_dir, f"mt5_signals_trades.{fmt_norm}")
+    if fmt_norm == "json":
+        _write_json_lines(trades_path, trades_records)
+    else:
+        _write_csv(trades_path, trades_records, _MT5_TRADE_COLUMNS)
+    if debug:
+        print(f"[mt5_export] wrote {trades_path} records={len(trades_records)}")
+
+    if mode_norm in ("decisions", "both"):
+        decisions_records = _build_mt5_decision_records(decisions)
+        decisions_path = os.path.join(out_dir, f"mt5_signals_decisions.{fmt_norm}")
+        if fmt_norm == "json":
+            _write_json_lines(decisions_path, decisions_records)
+        else:
+            _write_csv(decisions_path, decisions_records, _MT5_DECISION_COLUMNS)
+        if debug:
+            print(f"[mt5_export] wrote {decisions_path} records={len(decisions_records)}")
+
+    summary = {
+        "mt5_export": True,
+        "format": fmt_norm,
+        "mode": mode_norm,
+        "total_trades": int(len(trades_records)),
+        "total_decisions": int(len(decisions_records)),
+        "no_trades_reason": _safe_optional_str(no_trades_reason),
+        "no_decisions_reason": _safe_optional_str(no_decisions_reason),
+    }
+    summary_path = os.path.join(out_dir, "mt5_export_summary.json")
+    _write_mt5_export_summary(summary_path, summary)
+    if debug:
+        print(f"[mt5_export] wrote {summary_path}")
+
+    return summary
 
 
 def update_regime_ledger(
@@ -1339,8 +1902,17 @@ def main() -> None:
     ap.add_argument("--no_session_filter", type=int, default=0)
     ap.add_argument("--no_spread_filter", type=int, default=0)
     ap.add_argument("--legacy_features", type=int, default=0)
+    ap.add_argument("--mt5_export", type=int, default=0)
+    ap.add_argument("--mt5_out_dir", default=None)
+    ap.add_argument("--mt5_format", default="json")
+    ap.add_argument("--mt5_mode", default="trades")
 
     args = ap.parse_args()
+
+    mt5_export = _parse_bool_flag(args.mt5_export, default=False)
+    mt5_format = str(args.mt5_format or "json").strip().lower()
+    mt5_mode = str(args.mt5_mode or "trades").strip().lower()
+    mt5_out_dir = args.mt5_out_dir if args.mt5_out_dir not in (None, "") else args.out_dir
 
     ensure_dir(args.out_dir)
     out_equity = os.path.join(args.out_dir, "live_daily_equity.csv")
@@ -1349,6 +1921,15 @@ def main() -> None:
 
     debug_enabled = bool(int(args.debug)) if str(args.debug).strip() != "" else False
     debug_enabled = debug_enabled or (str(os.getenv("LIVE_SIM_DAILY_DEBUG", "")).strip() == "1")
+
+    if mt5_format not in ("json", "csv"):
+        mt5_format = "json"
+    if mt5_mode not in ("trades", "decisions", "both"):
+        mt5_mode = "trades"
+    mt5_collect_trades = bool(mt5_export)
+    mt5_collect_decisions = bool(mt5_export and mt5_mode in ("decisions", "both"))
+    if mt5_export:
+        ensure_dir(mt5_out_dir)
 
     df_raw, detected_sep = read_csv_smart(args.csv, debug=debug_enabled)
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
@@ -1421,6 +2002,36 @@ def main() -> None:
         write_equity_csv(out_equity, equity_rows)
         write_summary_json(out_summary, summary)
         write_regime_json(out_regime, regime_stats)
+
+        if mt5_export:
+            trades_export = df.copy()
+            trades_export, _ = _select_trade_time_col(trades_export)
+            no_trades_reason = None
+            if int(total_trades) == 0:
+                no_trades_reason = "no_trades_in_input"
+            no_decisions_reason = None
+            if mt5_collect_decisions:
+                no_decisions_reason = "decisions_unavailable_in_trades_mode"
+            export_mt5_signals(
+                out_dir=mt5_out_dir,
+                trades_df=trades_export,
+                trade_meta=None,
+                decisions=None,
+                fmt=mt5_format,
+                mode=mt5_mode,
+                input_csv=args.csv,
+                model_path=args.model_path,
+                power=float(args.power),
+                execution_settings=execution_settings,
+                session_settings=session_settings,
+                spread_open_cap=float(args.spread_open_cap),
+                spread_spike_cap=float(args.spread_spike_cap),
+                no_session_filter=bool(no_session_filter),
+                no_spread_filter=bool(no_spread_filter),
+                no_trades_reason=no_trades_reason,
+                no_decisions_reason=no_decisions_reason,
+                debug=debug_enabled,
+            )
 
         print(f"Saved: {out_equity} {out_summary} {out_regime}")
         print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
@@ -1534,6 +2145,10 @@ def main() -> None:
         "size_zero": 0,
     }
 
+    mt5_trades_frames: Optional[List[pd.DataFrame]] = [] if mt5_collect_trades else None
+    mt5_trade_meta: Optional[List[Dict[str, Any]]] = [] if mt5_collect_trades else None
+    mt5_decisions: Optional[List[Dict[str, Any]]] = [] if mt5_collect_decisions else None
+
     for day in days:
         mask = df["day"] == day
         df_day = df[mask].copy().reset_index(drop=True)
@@ -1555,7 +2170,19 @@ def main() -> None:
             bypass_session=no_session_filter,
             bypass_spread=no_spread_filter,
             debug=debug_enabled,
+            collect_decisions=mt5_collect_decisions,
+            collect_trade_meta=mt5_collect_trades,
         )
+        if mt5_trades_frames is not None and trades_df is not None and len(trades_df) > 0:
+            mt5_trades_frames.append(trades_df)
+            if mt5_trade_meta is not None:
+                day_meta = dbg.get("trade_meta", [])
+                if isinstance(day_meta, list) and day_meta:
+                    mt5_trade_meta.extend(day_meta)
+        if mt5_decisions is not None:
+            day_decisions = dbg.get("decision_rows", [])
+            if isinstance(day_decisions, list) and day_decisions:
+                mt5_decisions.extend(day_decisions)
         total_trades += int(dbg.get("allowed", 0))
         breakdown_totals["bars_after_session_filter"] += int(dbg.get("bars_after_session_filter", 0))
         breakdown_totals["bars_after_spread_filter"] += int(dbg.get("bars_after_spread_filter", 0))
@@ -1615,6 +2242,36 @@ def main() -> None:
             reason_hint = "all signals filtered by session/spread/guardrails"
         else:
             reason_hint = "signals allowed but no trades recorded by env"
+        if mt5_export:
+            trades_export_df = pd.DataFrame()
+            if mt5_trades_frames is not None and len(mt5_trades_frames) > 0:
+                try:
+                    trades_export_df = pd.concat(mt5_trades_frames, ignore_index=True)
+                except Exception:
+                    trades_export_df = pd.DataFrame()
+            no_decisions_reason = None
+            if mt5_collect_decisions and (not mt5_decisions):
+                no_decisions_reason = "no_decisions_collected"
+            export_mt5_signals(
+                out_dir=mt5_out_dir,
+                trades_df=trades_export_df,
+                trade_meta=mt5_trade_meta,
+                decisions=mt5_decisions,
+                fmt=mt5_format,
+                mode=mt5_mode,
+                input_csv=args.csv,
+                model_path=args.model_path,
+                power=float(args.power),
+                execution_settings=execution_settings,
+                session_settings=session_settings,
+                spread_open_cap=float(args.spread_open_cap),
+                spread_spike_cap=float(args.spread_spike_cap),
+                no_session_filter=bool(no_session_filter),
+                no_spread_filter=bool(no_spread_filter),
+                no_trades_reason=reason_hint,
+                no_decisions_reason=no_decisions_reason,
+                debug=debug_enabled,
+            )
         breakdown_totals["total_trades"] = int(total_trades)
         full_msg = _build_fail_hard_message(
             input_csv=args.csv,
@@ -1710,6 +2367,37 @@ def main() -> None:
     write_equity_csv(out_equity, equity_rows)
     write_summary_json(out_summary, summary)
     write_regime_json(out_regime, regime_stats)
+
+    if mt5_export:
+        trades_export_df = pd.DataFrame()
+        if mt5_trades_frames is not None and len(mt5_trades_frames) > 0:
+            try:
+                trades_export_df = pd.concat(mt5_trades_frames, ignore_index=True)
+            except Exception:
+                trades_export_df = pd.DataFrame()
+        no_decisions_reason = None
+        if mt5_collect_decisions and (not mt5_decisions):
+            no_decisions_reason = "no_decisions_collected"
+        export_mt5_signals(
+            out_dir=mt5_out_dir,
+            trades_df=trades_export_df,
+            trade_meta=mt5_trade_meta,
+            decisions=mt5_decisions,
+            fmt=mt5_format,
+            mode=mt5_mode,
+            input_csv=args.csv,
+            model_path=args.model_path,
+            power=float(args.power),
+            execution_settings=execution_settings,
+            session_settings=session_settings,
+            spread_open_cap=float(args.spread_open_cap),
+            spread_spike_cap=float(args.spread_spike_cap),
+            no_session_filter=bool(no_session_filter),
+            no_spread_filter=bool(no_spread_filter),
+            no_trades_reason=None,
+            no_decisions_reason=no_decisions_reason,
+            debug=debug_enabled,
+        )
 
     print(f"Saved: {out_equity} {out_summary} {out_regime}")
     print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
