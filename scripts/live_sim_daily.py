@@ -26,6 +26,7 @@ from rabit.rl.policy_linear import LinearPolicy
 from rabit.rl.ars_trainer import make_obs_matrix
 
 _FEATURE_DIAG_PRINTED = False
+_FEATURE_DIM_SLICE_WARNED = False
 
 _TRAIN_FEATURE_COLS = [
     "atr",
@@ -42,6 +43,18 @@ _TRAIN_FEATURE_COLS = [
     "body_over_atr",
     "uw_over_atr",
     "lw_over_atr",
+]
+
+_EQUITY_COLUMNS = [
+    "day",
+    "start_equity",
+    "end_equity",
+    "day_pnl",
+    "day_peak",
+    "day_min",
+    "intraday_dd",
+    "dd_stop",
+    "end_loss_streak",
 ]
 
 
@@ -525,6 +538,24 @@ def _row_to_feature_vector(row: Any, n_features: int) -> np.ndarray:
     return np.concatenate([vals, pad], axis=0)
 
 
+def _align_feature_vector(x: np.ndarray, n_features: int, debug: bool = False) -> np.ndarray:
+    global _FEATURE_DIM_SLICE_WARNED
+    if n_features <= 0:
+        return x
+    if len(x) > int(n_features):
+        if debug and not _FEATURE_DIM_SLICE_WARNED:
+            print(
+                f"[warn] feature_dim: data={len(x)} > model={int(n_features)}; slicing to match"
+            )
+            _FEATURE_DIM_SLICE_WARNED = True
+        return x[: int(n_features)]
+    if len(x) < int(n_features):
+        raise RuntimeError(
+            f"Feature dimension mismatch: got {len(x)}, expected {int(n_features)}"
+        )
+    return x
+
+
 def _decide_compat(model: Any, row: Any, debug: bool = False) -> Tuple[int, float, Dict[str, Any]]:
     global _FEATURE_DIAG_PRINTED
     policies = getattr(model, "policies", None)
@@ -682,6 +713,8 @@ def run_one_day(
     X_day: Optional[np.ndarray] = None,
     n_features: int = 0,
     legacy_features: bool = False,
+    bypass_session: bool = False,
+    bypass_spread: bool = False,
     debug: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float, Dict[str, Any]]:
     if legacy_features:
@@ -715,6 +748,11 @@ def run_one_day(
             session_filter=session_filter,
         )
 
+    spread_open_cap = int(cfg.get("spread_open_cap", 200))
+    spread_spike_cap = int(cfg.get("spread_spike_cap", 300))
+    max_loss_streak = int(cfg.get("max_loss_streak", 4))
+    daily_dd_limit = float(cfg.get("daily_dd_limit", 200.0))
+
     debug_info: Dict[str, Any] = {
         "bars": int(len(df_day)),
         "signals": 0,
@@ -722,12 +760,22 @@ def run_one_day(
         "dd_stop": False,
         "end_loss_streak": 0,
         "bars_total": int(len(df_day)),
+        "bars_after_time_parse": int(len(df_day)),
+        "bars_after_session_filter": 0,
+        "bars_after_spread_filter": 0,
         "signals_total": 0,
+        "signals_after_guardrails": 0,
+        "final_allowed": 0,
         "pass_session": 0,
         "pass_spread_open": 0,
         "pass_spread_spike": 0,
         "pass_guardrails": 0,
-        "final_allowed": 0,
+        "session_reject": 0,
+        "spread_open_reject": 0,
+        "spread_spike_reject": 0,
+        "guardrail_reject": 0,
+        "policy_hold": 0,
+        "size_zero": 0,
     }
 
     loss_streak = 0
@@ -739,7 +787,7 @@ def run_one_day(
     idx_ptr = {"i": 0}
 
     def _session_ok(ts: pd.Timestamp) -> bool:
-        if session_filter is None:
+        if bypass_session or session_filter is None:
             return True
         try:
             return bool(session_filter.is_open(ts))
@@ -758,6 +806,17 @@ def run_one_day(
             idx_ptr["i"] += 1
 
         ts = parse_ts(row.get("time", row.get("timestamp", row.name)))
+        spread_points = int(row.get("spread", 0))
+        session_ok = _session_ok(ts)
+        spread_open_ok = True
+        spread_spike_ok = True
+        if not bypass_spread:
+            spread_open_ok = spread_points <= spread_open_cap
+            spread_spike_ok = spread_points <= spread_spike_cap
+        if session_ok:
+            debug_info["bars_after_session_filter"] += 1
+            if spread_open_ok and spread_spike_ok:
+                debug_info["bars_after_spread_filter"] += 1
         if hasattr(model, "decide"):
             direction, raw_conf, info = model.decide(row)
         else:
@@ -771,14 +830,9 @@ def run_one_day(
                 else:
                     x = X_day[i_idx]
                 x = np.asarray(x, dtype=np.float64).reshape(-1)
-                if n_features > 0 and len(x) != int(n_features):
-                    raise RuntimeError(
-                        f"Feature dimension mismatch: got {len(x)}, expected {int(n_features)}"
-                    )
+                x = _align_feature_vector(x, n_features, debug=debug)
                 direction, raw_conf, info = _decide_from_features(model, x, row=row, debug=debug)
         debug_info["signals"] += 1
-        if int(direction) != 0:
-            debug_info["signals_total"] += 1
 
         if hasattr(weighter, "size_from_confidence"):
             size_conf = float(weighter.size_from_confidence(float(raw_conf)))
@@ -798,19 +852,38 @@ def run_one_day(
         equity_min = min(equity_min, cur_equity)
         intraday_dd = equity_peak - cur_equity
 
-        if intraday_dd >= float(cfg.get("daily_dd_limit", 200.0)):
+        if intraday_dd >= daily_dd_limit:
             dd_stop = True
 
-        if int(direction) != 0:
-            if _session_ok(ts):
-                debug_info["pass_session"] += 1
-            spread_points = int(row.get("spread", 0))
-            if spread_points <= int(cfg.get("spread_open_cap", 200)):
-                debug_info["pass_spread_open"] += 1
-            if spread_points <= int(cfg.get("spread_spike_cap", 300)):
-                debug_info["pass_spread_spike"] += 1
-            if allow and (not dd_stop) and (loss_streak < int(cfg.get("max_loss_streak", 4))):
-                debug_info["pass_guardrails"] += 1
+        if int(direction) == 0:
+            debug_info["policy_hold"] += 1
+            return (0, 0.8, 0.8, 20)
+
+        debug_info["signals_total"] += 1
+        if session_ok:
+            debug_info["pass_session"] += 1
+        if spread_open_ok:
+            debug_info["pass_spread_open"] += 1
+        if spread_spike_ok:
+            debug_info["pass_spread_spike"] += 1
+        guardrails_ok = allow and (not dd_stop) and (loss_streak < max_loss_streak)
+        if guardrails_ok:
+            debug_info["pass_guardrails"] += 1
+            debug_info["signals_after_guardrails"] += 1
+
+        if guardrails_ok and session_ok and spread_open_ok and spread_spike_ok:
+            debug_info["final_allowed"] += 1
+
+        if not session_ok:
+            debug_info["session_reject"] += 1
+        elif not spread_open_ok:
+            debug_info["spread_open_reject"] += 1
+        elif not spread_spike_ok:
+            debug_info["spread_spike_reject"] += 1
+        elif not allow:
+            debug_info["size_zero"] += 1
+        elif dd_stop or loss_streak >= max_loss_streak:
+            debug_info["guardrail_reject"] += 1
 
         if dd_stop or not allow:
             return (0, 0.8, 0.8, 20)
@@ -851,6 +924,18 @@ def run_one_day(
         except Exception:
             trades_df = pd.DataFrame()
 
+    regime_counts: Dict[str, int] = {}
+    if len(trades_df) > 0 and "regime" in trades_df.columns:
+        try:
+            regime_counts = (
+                trades_df["regime"]
+                .astype(str)
+                .value_counts(dropna=True)
+                .to_dict()
+            )
+        except Exception:
+            regime_counts = {}
+
     if len(equity_df) == 0 and hasattr(ledger, "equity_curve"):
         try:
             eq_obj = getattr(ledger, "equity_curve")
@@ -890,16 +975,29 @@ def run_one_day(
                 date_key = tts.date().isoformat()
                 pnl = _safe_float(tr[pnl_col], 0.0)
                 regime = tr["regime"] if "regime" in trades_df.columns else "unknown"
-                meta_state.update_trade(str(regime), float(pnl), date_key=date_key)
+        try:
+            # ưu tiên positional để tránh mismatch keyword
+            meta_state.update_trade(str(regime), float(pnl), date_key)
+        except TypeError:
+            # fallback: một số version dùng date_str / date / ts_col khác tên
+            try:
+                meta_state.update_trade(str(regime), float(pnl), date_str=date_key)
+            except TypeError:
+                try:
+                    meta_state.update_trade(str(regime), float(pnl), date=date_key)
+                except TypeError:
+                    # cuối cùng: gọi đúng 2 tham số nếu bản MetaRiskState không nhận date
+                    meta_state.update_trade(str(regime), float(pnl))
 
     debug_info["allowed"] = int(len(trades_df)) if len(trades_df) > 0 else int(count_closed_trades(ledger))
-    debug_info["final_allowed"] = int(debug_info["allowed"])
+    debug_info["total_trades"] = int(debug_info["allowed"])
     debug_info["dd_stop"] = bool(dd_stop)
     debug_info["equity_start"] = float(equity_start)
     debug_info["equity_end"] = float(global_balance + day_pnl)
     debug_info["equity_peak"] = float(equity_peak)
     debug_info["equity_min"] = float(equity_min)
     debug_info["intraday_dd"] = float(max(0.0, equity_peak - (global_balance + day_pnl)))
+    debug_info["regime_counts"] = regime_counts
 
     return trades_df, equity_df, day_pnl, debug_info
 
@@ -955,6 +1053,16 @@ def _make_session_filter(session_cfg: Dict[str, Any]) -> Optional[SessionFilter]
 
 def write_equity_csv(path: str, equity_rows: List[Dict[str, Any]]) -> None:
     eq_df = pd.DataFrame(equity_rows)
+    for c in _EQUITY_COLUMNS:
+        if c not in eq_df.columns:
+            if c in ("dd_stop",):
+                eq_df[c] = False
+            else:
+                eq_df[c] = 0
+    if "equity" not in eq_df.columns and "end_equity" in eq_df.columns:
+        eq_df["equity"] = eq_df["end_equity"]
+    ordered = _EQUITY_COLUMNS + [c for c in eq_df.columns if c not in _EQUITY_COLUMNS]
+    eq_df = eq_df[ordered]
     eq_df.to_csv(path, index=False)
 
 
@@ -970,14 +1078,17 @@ def write_regime_json(path: str, regime_stats: Dict[str, Any]) -> None:
 
 def _build_fail_hard_message(
     input_csv: str,
+    model_path: str,
     bars_loaded: int,
     time_col: str,
     first_ts: Optional[pd.Timestamp],
     last_ts: Optional[pd.Timestamp],
     detected_cols: List[str],
     session: Dict[str, Any],
+    no_session_filter: bool,
     spread_open_cap: float,
     spread_spike_cap: float,
+    no_spread_filter: bool,
     daily_dd_limit: float,
     max_loss_streak: int,
     power: float,
@@ -990,6 +1101,7 @@ def _build_fail_hard_message(
     breakdown: Optional[Dict[str, Any]] = None,
     reason_hint: str = "all signals filtered by session/spread/guardrails",
     notes: str = "Try disabling session filter or increasing spread caps to verify pipeline",
+    short: bool = False,
 ) -> str:
     first_s = str(first_ts) if first_ts is not None else "None"
     last_s = str(last_ts) if last_ts is not None else "None"
@@ -997,37 +1109,75 @@ def _build_fail_hard_message(
         f"session_filter: enable_london={session.get('enable_london')} "
         f"london=[{session.get('london_start')},{session.get('london_end')}] "
         f"enable_ny={session.get('enable_ny')} "
-        f"ny=[{session.get('ny_start')},{session.get('ny_end')}]"
+        f"ny=[{session.get('ny_start')},{session.get('ny_end')}] "
+        f"no_session_filter={int(no_session_filter)}"
     )
+    spread_line = (
+        f"spread_caps: spread_open_cap={spread_open_cap} "
+        f"spread_spike_cap={spread_spike_cap} no_spread_filter={int(no_spread_filter)}"
+    )
+
+    def _breakdown_line(bd: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(bd, dict) or not bd:
+            return ""
+        parts = [
+            f"bars_total={bd.get('bars_total', 0)}",
+            f"bars_after_time_parse={bd.get('bars_after_time_parse', 0)}",
+            f"bars_after_session_filter={bd.get('bars_after_session_filter', 0)}",
+            f"bars_after_spread_filter={bd.get('bars_after_spread_filter', 0)}",
+            f"signals_total={bd.get('signals_total', 0)}",
+            f"signals_after_guardrails={bd.get('signals_after_guardrails', 0)}",
+            f"final_allowed={bd.get('final_allowed', 0)}",
+            f"total_trades={bd.get('total_trades', 0)}",
+        ]
+        return "breakdown: " + " ".join(parts)
+
+    def _reasons_line(bd: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(bd, dict) or not bd:
+            return ""
+        parts = [
+            f"session_reject={bd.get('session_reject', 0)}",
+            f"spread_open_reject={bd.get('spread_open_reject', 0)}",
+            f"spread_spike_reject={bd.get('spread_spike_reject', 0)}",
+            f"guardrail_reject={bd.get('guardrail_reject', 0)}",
+            f"policy_hold={bd.get('policy_hold', 0)}",
+            f"size_zero={bd.get('size_zero', 0)}",
+        ]
+        return "reasons: " + " ".join(parts)
+
+    if short:
+        lines = [
+            "Task-3I FAIL: total_trades==0 (bars mode)",
+            _breakdown_line(breakdown),
+            _reasons_line(breakdown),
+            f"model_path={model_path}",
+            session_line,
+            spread_line,
+            f"fail_safe: daily_dd_limit={daily_dd_limit} max_loss_streak={max_loss_streak}",
+            f"meta_risk: enabled={int(meta_risk)} meta_feedback={int(meta_feedback)} state_path={meta_state_path}",
+        ]
+        return "\n".join([l for l in lines if l])
+
     lines = [
-        "Task-3H FAIL: total_trades==0 (bars mode)",
+        "Task-3I FAIL: total_trades==0 (bars mode)",
         f"reason_hint={reason_hint}",
         f"input_csv={input_csv}",
+        f"model_path={model_path}",
         f"bars_loaded={bars_loaded}",
         f"time_col={time_col}  first_ts={first_s}  last_ts={last_s}",
         f"detected_cols={','.join(detected_cols)}",
         session_line,
-        f"spread_caps: spread_open_cap={spread_open_cap} spread_spike_cap={spread_spike_cap}",
+        spread_line,
         f"gating: power={power} min_size={min_size} max_size={max_size} deadzone={deadzone}",
         f"fail_safe: daily_dd_limit={daily_dd_limit} max_loss_streak={max_loss_streak}",
         f"meta_risk: enabled={int(meta_risk)}  meta_feedback={int(meta_feedback)}  state_path={meta_state_path}",
     ]
-    if isinstance(breakdown, dict) and breakdown:
-        lines.append(
-            "breakdown: "
-            + " ".join(
-                [
-                    f"bars_total={breakdown.get('bars_total', 0)}",
-                    f"signals_total={breakdown.get('signals_total', 0)}",
-                    f"pass_session={breakdown.get('pass_session', 0)}",
-                    f"pass_spread_open={breakdown.get('pass_spread_open', 0)}",
-                    f"pass_spread_spike={breakdown.get('pass_spread_spike', 0)}",
-                    f"pass_guardrails={breakdown.get('pass_guardrails', 0)}",
-                    f"final_allowed={breakdown.get('final_allowed', 0)}",
-                    f"total_trades={breakdown.get('total_trades', 0)}",
-                ]
-            )
-        )
+    breakdown_line = _breakdown_line(breakdown)
+    if breakdown_line:
+        lines.append(breakdown_line)
+    reasons_line = _reasons_line(breakdown)
+    if reasons_line:
+        lines.append(reasons_line)
     lines.append(f"notes: {notes}")
     return "\n".join(lines)
 
@@ -1088,6 +1238,7 @@ def _aggregate_trades_daily(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Lis
     worst_day = None
     global_balance = 0.0
 
+    has_regime = "regime" in out.columns
     for day in days:
         g = out[out["day"] == day]
         day_pnl = float(pd.to_numeric(g[pnl_col], errors="coerce").fillna(0.0).sum())
@@ -1107,15 +1258,9 @@ def _aggregate_trades_daily(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Lis
             "end_loss_streak": 0,
         }
         daily_rows.append(row)
-        equity_rows.append(
-            {
-                "day": day,
-                "start_equity": start_equity,
-                "end_equity": end_equity,
-                "day_pnl": float(end_equity - start_equity),
-                "equity": end_equity,
-            }
-        )
+        eq_row = dict(row)
+        eq_row["equity"] = end_equity
+        equity_rows.append(eq_row)
 
         if best_day is None or row["day_pnl"] > best_day["day_pnl"]:
             best_day = dict(row)
@@ -1124,14 +1269,20 @@ def _aggregate_trades_daily(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Lis
 
         day_trades = int(len(g))
         total_trades += day_trades
-        regime_stats["days"].append(
-            {
-                "day": day,
-                "signals": day_trades,
-                "allowed": day_trades,
-                "dd_stop": False,
-            }
-        )
+        regime_day = {
+            "day": day,
+            "signals": day_trades,
+            "allowed": day_trades,
+            "dd_stop": False,
+        }
+        if has_regime:
+            try:
+                regime_counts = g["regime"].astype(str).value_counts(dropna=True).to_dict()
+                if regime_counts:
+                    regime_day["regime_counts"] = regime_counts
+            except Exception:
+                pass
+        regime_stats["days"].append(regime_day)
 
         global_balance = end_equity
 
@@ -1162,6 +1313,12 @@ def main() -> None:
     ap.add_argument("--debug", type=int, default=0)
     ap.add_argument("--enable_london", type=int, default=1)
     ap.add_argument("--enable_ny", type=int, default=1)
+    ap.add_argument("--london_start", type=int, default=None)
+    ap.add_argument("--london_end", type=int, default=None)
+    ap.add_argument("--ny_start", type=int, default=None)
+    ap.add_argument("--ny_end", type=int, default=None)
+    ap.add_argument("--no_session_filter", type=int, default=0)
+    ap.add_argument("--no_spread_filter", type=int, default=0)
     ap.add_argument("--legacy_features", type=int, default=0)
 
     args = ap.parse_args()
@@ -1176,6 +1333,7 @@ def main() -> None:
 
     df_raw, detected_sep = read_csv_smart(args.csv, debug=debug_enabled)
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
+    bars_total_raw = int(len(df_raw))
     df, _ = _normalize_columns(df_raw)
 
     _debug_print(debug_enabled, f"[debug] normalized_cols={list(df.columns)}")
@@ -1188,6 +1346,16 @@ def main() -> None:
     session_settings = _default_session_settings()
     session_settings["enable_london"] = _parse_bool_flag(args.enable_london, default=True)
     session_settings["enable_ny"] = _parse_bool_flag(args.enable_ny, default=True)
+    if args.london_start is not None:
+        session_settings["london_start"] = int(args.london_start)
+    if args.london_end is not None:
+        session_settings["london_end"] = int(args.london_end)
+    if args.ny_start is not None:
+        session_settings["ny_start"] = int(args.ny_start)
+    if args.ny_end is not None:
+        session_settings["ny_end"] = int(args.ny_end)
+    no_session_filter = _parse_bool_flag(args.no_session_filter, default=False)
+    no_spread_filter = _parse_bool_flag(args.no_spread_filter, default=False)
     execution_settings = _default_execution_settings()
 
     if mode == "trades":
@@ -1252,15 +1420,25 @@ def main() -> None:
         df, _feat, feature_cols, X_all = _build_feature_pipeline(df, debug=debug_enabled)
         if model_n_features <= 0:
             raise ValueError("Model n_features could not be inferred; check model file")
-        if int(X_all.shape[1]) != int(model_n_features):
+        data_n_features = int(X_all.shape[1])
+        if data_n_features > int(model_n_features):
+            if debug_enabled:
+                _debug_print(
+                    debug_enabled,
+                    f"[warn] feature_dim: data={data_n_features} > model={model_n_features}; slicing",
+                )
+            X_all = X_all[:, : int(model_n_features)]
+            feature_cols = feature_cols[: int(model_n_features)]
+            data_n_features = int(X_all.shape[1])
+        if data_n_features < int(model_n_features):
             raise ValueError(
-                f"Feature dimension mismatch: model_n_features={model_n_features} "
-                f"feature_cols={len(feature_cols)}"
+                "Feature dimension mismatch: FeatureBuilder produced "
+                f"{data_n_features} < model_n_features={model_n_features}"
             )
         _debug_print(
             debug_enabled,
             f"[debug] feature_source=TradingEnv feature_dims model={model_n_features} "
-            f"data={X_all.shape[1]} match={int(X_all.shape[1]) == int(model_n_features)}",
+            f"data={data_n_features} match={int(data_n_features) == int(model_n_features)}",
         )
     weighter_cfg = ConfidenceWeighterConfig(
         power=float(args.power),
@@ -1281,14 +1459,22 @@ def main() -> None:
             except Exception as e:
                 print(f"[meta_risk] warn: cannot load state: {e}")
 
+    spread_open_cap = float(args.spread_open_cap)
+    spread_spike_cap = float(args.spread_spike_cap)
+    spread_open_cap_used = spread_open_cap
+    spread_spike_cap_used = spread_spike_cap
+    if no_spread_filter:
+        spread_open_cap_used = 1e9
+        spread_spike_cap_used = 1e9
+
     cfg = {
         "daily_dd_limit": float(args.daily_dd_limit),
         "max_loss_streak": int(args.max_loss_streak),
-        "spread_spike_cap": float(args.spread_spike_cap),
-        "spread_open_cap": float(args.spread_open_cap),
+        "spread_spike_cap": float(spread_spike_cap_used),
+        "spread_open_cap": float(spread_open_cap_used),
         "atr_period": int(args.atr_period),
     }
-    session_filter = _make_session_filter(session_settings)
+    session_filter = None if no_session_filter else _make_session_filter(session_settings)
 
     df["day"] = df["time"].dt.date.astype(str)
     days = df["day"].unique().tolist()
@@ -1302,13 +1488,20 @@ def main() -> None:
     worst_day = None
     total_trades = 0
     breakdown_totals = {
-        "bars_total": 0,
+        "bars_total": int(bars_total_raw),
+        "bars_after_time_parse": int(len(df)),
+        "bars_after_session_filter": 0,
+        "bars_after_spread_filter": 0,
         "signals_total": 0,
-        "pass_session": 0,
-        "pass_spread_open": 0,
-        "pass_spread_spike": 0,
-        "pass_guardrails": 0,
+        "signals_after_guardrails": 0,
         "final_allowed": 0,
+        "total_trades": 0,
+        "session_reject": 0,
+        "spread_open_reject": 0,
+        "spread_spike_reject": 0,
+        "guardrail_reject": 0,
+        "policy_hold": 0,
+        "size_zero": 0,
     }
 
     for day in days:
@@ -1329,16 +1522,22 @@ def main() -> None:
             X_day=X_day,
             n_features=model_n_features,
             legacy_features=legacy_features,
+            bypass_session=no_session_filter,
+            bypass_spread=no_spread_filter,
             debug=debug_enabled,
         )
         total_trades += int(dbg.get("allowed", 0))
-        breakdown_totals["bars_total"] += int(dbg.get("bars_total", 0))
+        breakdown_totals["bars_after_session_filter"] += int(dbg.get("bars_after_session_filter", 0))
+        breakdown_totals["bars_after_spread_filter"] += int(dbg.get("bars_after_spread_filter", 0))
         breakdown_totals["signals_total"] += int(dbg.get("signals_total", 0))
-        breakdown_totals["pass_session"] += int(dbg.get("pass_session", 0))
-        breakdown_totals["pass_spread_open"] += int(dbg.get("pass_spread_open", 0))
-        breakdown_totals["pass_spread_spike"] += int(dbg.get("pass_spread_spike", 0))
-        breakdown_totals["pass_guardrails"] += int(dbg.get("pass_guardrails", 0))
+        breakdown_totals["signals_after_guardrails"] += int(dbg.get("signals_after_guardrails", 0))
         breakdown_totals["final_allowed"] += int(dbg.get("final_allowed", 0))
+        breakdown_totals["session_reject"] += int(dbg.get("session_reject", 0))
+        breakdown_totals["spread_open_reject"] += int(dbg.get("spread_open_reject", 0))
+        breakdown_totals["spread_spike_reject"] += int(dbg.get("spread_spike_reject", 0))
+        breakdown_totals["guardrail_reject"] += int(dbg.get("guardrail_reject", 0))
+        breakdown_totals["policy_hold"] += int(dbg.get("policy_hold", 0))
+        breakdown_totals["size_zero"] += int(dbg.get("size_zero", 0))
 
         start_equity = float(global_balance)
         end_equity = float(global_balance + day_pnl)
@@ -1357,15 +1556,9 @@ def main() -> None:
         }
         daily_rows.append(row)
 
-        equity_rows.append(
-            {
-                "day": day,
-                "start_equity": start_equity,
-                "end_equity": end_equity,
-                "day_pnl": float(end_equity - start_equity),
-                "equity": end_equity,
-            }
-        )
+        eq_row = dict(row)
+        eq_row["equity"] = end_equity
+        equity_rows.append(eq_row)
 
         if best_day is None or row["day_pnl"] > best_day["day_pnl"]:
             best_day = dict(row)
@@ -1374,31 +1567,38 @@ def main() -> None:
 
         global_balance = end_equity
 
-        regime_stats["days"].append(
-            {
-                "day": day,
-                "signals": int(dbg.get("signals", 0)),
-                "allowed": int(dbg.get("allowed", 0)),
-                "dd_stop": bool(dbg.get("dd_stop", False)),
-            }
-        )
+        regime_day = {
+            "day": day,
+            "signals": int(dbg.get("signals", 0)),
+            "allowed": int(dbg.get("allowed", 0)),
+            "dd_stop": bool(dbg.get("dd_stop", False)),
+        }
+        regime_counts = dbg.get("regime_counts", {})
+        if isinstance(regime_counts, dict) and regime_counts:
+            regime_day["regime_counts"] = regime_counts
+        regime_stats["days"].append(regime_day)
 
     if int(total_trades) == 0:
         if int(breakdown_totals.get("signals_total", 0)) == 0:
             reason_hint = "policy never signaled (all hold)"
-        else:
+        elif int(breakdown_totals.get("final_allowed", 0)) == 0:
             reason_hint = "all signals filtered by session/spread/guardrails"
+        else:
+            reason_hint = "signals allowed but no trades recorded by env"
         breakdown_totals["total_trades"] = int(total_trades)
-        msg = _build_fail_hard_message(
+        full_msg = _build_fail_hard_message(
             input_csv=args.csv,
+            model_path=args.model_path,
             bars_loaded=int(len(df)),
             time_col=str(time_col),
             first_ts=df["time"].iloc[0] if len(df) > 0 else None,
             last_ts=df["time"].iloc[-1] if len(df) > 0 else None,
             detected_cols=list(df.columns),
             session=session_settings,
-            spread_open_cap=float(args.spread_open_cap),
-            spread_spike_cap=float(args.spread_spike_cap),
+            no_session_filter=bool(no_session_filter),
+            spread_open_cap=float(spread_open_cap),
+            spread_spike_cap=float(spread_spike_cap),
+            no_spread_filter=bool(no_spread_filter),
             daily_dd_limit=float(args.daily_dd_limit),
             max_loss_streak=int(args.max_loss_streak),
             power=float(args.power),
@@ -1411,7 +1611,35 @@ def main() -> None:
             breakdown=breakdown_totals,
             reason_hint=reason_hint,
         )
-        raise RuntimeError(msg)
+        short_msg = _build_fail_hard_message(
+            input_csv=args.csv,
+            model_path=args.model_path,
+            bars_loaded=int(len(df)),
+            time_col=str(time_col),
+            first_ts=df["time"].iloc[0] if len(df) > 0 else None,
+            last_ts=df["time"].iloc[-1] if len(df) > 0 else None,
+            detected_cols=list(df.columns),
+            session=session_settings,
+            no_session_filter=bool(no_session_filter),
+            spread_open_cap=float(spread_open_cap),
+            spread_spike_cap=float(spread_spike_cap),
+            no_spread_filter=bool(no_spread_filter),
+            daily_dd_limit=float(args.daily_dd_limit),
+            max_loss_streak=int(args.max_loss_streak),
+            power=float(args.power),
+            min_size=float(args.min_size),
+            max_size=float(args.max_size),
+            deadzone=float(args.deadzone),
+            meta_risk=int(args.meta_risk),
+            meta_feedback=int(args.meta_feedback),
+            meta_state_path=args.meta_state_path,
+            breakdown=breakdown_totals,
+            reason_hint=reason_hint,
+            short=True,
+        )
+        if debug_enabled:
+            print(full_msg)
+        raise RuntimeError(short_msg)
 
     summary = {
         "model_path": args.model_path,
