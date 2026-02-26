@@ -22,6 +22,7 @@ from scripts import deterministic_utils as det
 from rabit.data.feature_builder import FeatureBuilder, FeatureConfig
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
+from rabit.rl.regime_perf_feedback import RegimePerfConfig, RegimePerfFeedbackEngine
 from rabit.rl.regime_ledger import RegimeLedgerConfig, RegimeLedgerState
 from rabit.env.trading_env import TradingEnv
 from rabit.env.session_filter import SessionFilter, SessionConfig
@@ -118,6 +119,49 @@ def ensure_dir(path: str) -> None:
 def _debug_print(enabled: bool, msg: str) -> None:
     if enabled:
         print(msg)
+
+
+def _format_perf_change(
+    change: Dict[str, Any],
+    engine: Optional[RegimePerfFeedbackEngine],
+) -> str:
+    regime = str(change.get("regime", "unknown"))
+    prev_scale = change.get("prev_scale", 1.0)
+    new_scale = change.get("new_scale", 1.0)
+    reason = change.get("reason", "")
+    wr = None
+    pnl = None
+    if engine is not None:
+        dbg = engine.get_debug(regime)
+        wr = dbg.get("winrate_ewm")
+        pnl = dbg.get("pnl_mean_ewm")
+    parts = [f"{regime} {float(prev_scale):.2f}->{float(new_scale):.2f} {reason}"]
+    if wr is not None:
+        parts.append(f"wr={float(wr):.2f}")
+    if pnl is not None:
+        parts.append(f"pnl={float(pnl):.4f}")
+    return " ".join(parts).strip()
+
+
+def _debug_perf_update(
+    enabled: bool,
+    day_key: Optional[str],
+    update_info: Optional[Dict[str, Any]],
+    engine: Optional[RegimePerfFeedbackEngine],
+    limit: int = 3,
+) -> None:
+    if not enabled or engine is None or not update_info:
+        return
+    changes = update_info.get("scale_changes", []) or []
+    regimes_seen = engine.regimes_seen()
+    if changes:
+        parts = [_format_perf_change(ch, engine) for ch in changes[:limit]]
+        if len(changes) > limit:
+            parts.append(f"+{len(changes) - limit} more")
+        msg = f"[regime_perf] day={day_key} regimes={len(regimes_seen)} changes={len(changes)} " + "; ".join(parts)
+    else:
+        msg = f"[regime_perf] day={day_key} regimes={len(regimes_seen)} changes=0"
+    print(msg)
 
 
 def _read_sample_line(path: str, max_chars: int = 200) -> str:
@@ -509,6 +553,58 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def _risk_cap_position_size(
+    model_size: float,
+    sl_mult: float,
+    atr: float,
+    equity_at_entry: float,
+    risk_per_trade: float,
+    sl_min_price: float,
+    contract_value_per_1_0_move: float,
+    min_lot: float,
+    max_lot: float,
+    eps: float = 1e-9,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Apply a hard risk cap to the model size.
+    Size is interpreted in the same volume units used by the ledger (lot-equivalent).
+    """
+    model_size = max(0.0, _safe_float(model_size, 0.0))
+    sl_mult = max(0.0, _safe_float(sl_mult, 0.0))
+    atr = max(0.0, _safe_float(atr, 0.0))
+    equity_at_entry = max(0.0, _safe_float(equity_at_entry, 0.0))
+    risk_per_trade = max(0.0, _safe_float(risk_per_trade, 0.0))
+    sl_min_price = max(0.0, _safe_float(sl_min_price, 0.0))
+    contract_value_per_1_0_move = max(0.0, _safe_float(contract_value_per_1_0_move, 0.0))
+    min_lot = max(0.0, _safe_float(min_lot, 0.0))
+    max_lot = max(min_lot, _safe_float(max_lot, 0.0))
+
+    risk_budget = float(risk_per_trade * equity_at_entry)
+    sl_distance_price = float(max(sl_mult * atr, sl_min_price))
+    usd_loss_per_1lot = float(sl_distance_price * contract_value_per_1_0_move)
+    cap_lots = float(risk_budget / max(usd_loss_per_1lot, eps)) if risk_budget > 0.0 else 0.0
+
+    if model_size <= 0.0 or cap_lots <= 0.0 or risk_budget <= 0.0:
+        final_size = 0.0
+    else:
+        capped = min(model_size, cap_lots)
+        # Preserve risk cap when cap_lots < min_lot (do not lift above cap).
+        if cap_lots < min_lot:
+            final_size = float(max(0.0, capped))
+        else:
+            final_size = float(np.clip(capped, min_lot, max_lot))
+
+    debug = {
+        "risk_budget_usd": float(risk_budget),
+        "sl_distance_price": float(sl_distance_price),
+        "usd_loss_per_1lot_if_sl": float(usd_loss_per_1lot),
+        "cap_lots": float(cap_lots),
+        "model_size": float(model_size),
+        "final_size": float(final_size),
+    }
+    return float(final_size), debug
+
+
 def _compute_pnl_from_trades_df(trades_df: pd.DataFrame) -> float:
     if trades_df is None or len(trades_df) == 0:
         return 0.0
@@ -756,6 +852,7 @@ def run_one_day(
     weighter: ConfidenceWeighter,
     meta_state: Optional[MetaRiskState],
     meta_feedback: bool,
+    regime_feedback: Optional[RegimePerfFeedbackEngine],
     session_filter: Optional[SessionFilter],
     cfg: Dict[str, Any],
     global_balance: float,
@@ -898,20 +995,36 @@ def run_one_day(
             size_conf = float(weighter.size_from_confidence(float(raw_conf)))
         else:
             size_conf = float(weighter.size(float(raw_conf)))
-        allow = size_conf > 0.0
+        allow_conf = size_conf > 0.0
 
         regime = info.get("regime", "unknown") if isinstance(info, dict) else "unknown"
 
-        meta_scale = 1.0
+        meta_scale_base = 1.0
         meta_reason = None
         if meta_state is not None:
             try:
-                meta_scale, meta_reason = meta_state.meta_scale_with_reason(regime, update_state=False)
+                meta_scale_base, meta_reason = meta_state.meta_scale_with_reason(regime, update_state=False)
             except Exception:
-                meta_scale = float(meta_state.meta_scale(regime))
+                meta_scale_base = float(meta_state.meta_scale(regime))
                 meta_reason = None
 
-        final_size = size_conf * meta_scale
+        regime_scale = 1.0
+        regime_reason = None
+        if regime_feedback is not None:
+            try:
+                regime_scale, regime_reason = regime_feedback.get_scale_with_reason(regime)
+            except Exception:
+                regime_scale = float(regime_feedback.get_scale(regime))
+                regime_reason = None
+
+        meta_scale = float(meta_scale_base) * float(regime_scale)
+        if regime_reason:
+            if meta_reason:
+                meta_reason = f"{meta_reason}|perf:{regime_reason}"
+            else:
+                meta_reason = f"perf:{regime_reason}"
+
+        model_size = float(size_conf) * float(meta_scale)
 
         cur_equity = global_balance + get_balance(env.ledger)
         equity_peak = max(equity_peak, cur_equity)
@@ -921,6 +1034,35 @@ def run_one_day(
         if intraday_dd >= daily_dd_limit:
             dd_stop = True
 
+        # Apply hard risk cap to final size before guardrails.
+        tp_mult = float(cfg.get("tp_mult", 0.8))
+        sl_mult = float(cfg.get("sl_mult", 0.8))
+        hold_max = int(cfg.get("hold_max", 20))
+        atr = _safe_float(row.get("atr", 0.0), 0.0)
+        atr = max(atr, 0.05)
+        final_size, risk_dbg = _risk_cap_position_size(
+            model_size=model_size,
+            sl_mult=sl_mult,
+            atr=atr,
+            equity_at_entry=cur_equity,
+            risk_per_trade=cfg.get("risk_per_trade", 0.02),
+            sl_min_price=cfg.get("sl_min_price", 0.0),
+            contract_value_per_1_0_move=cfg.get("contract_value_per_1_0_move", 0.0),
+            min_lot=cfg.get("min_lot", 0.0),
+            max_lot=cfg.get("max_lot", 1.0),
+        )
+        if debug and int(direction) != 0:
+            _debug_print(
+                debug,
+                "[risk_cap] "
+                f"risk_budget_usd={risk_dbg.get('risk_budget_usd'):.4f} "
+                f"sl_distance_price={risk_dbg.get('sl_distance_price'):.4f} "
+                f"cap_lots={risk_dbg.get('cap_lots'):.4f} "
+                f"model_size={risk_dbg.get('model_size'):.4f} "
+                f"final_size={risk_dbg.get('final_size'):.4f}",
+            )
+
+        allow = allow_conf and float(final_size) > 0.0
         guardrails_ok = allow and (not dd_stop) and (loss_streak < max_loss_streak)
         guard_reason = "ok"
         if int(direction) == 0:
@@ -945,7 +1087,18 @@ def run_one_day(
                 decision_action = "BUY"
             else:
                 decision_action = "SELL"
-            exec_size = float(np.clip(final_size, 0.0, 1.0))
+            exec_size = float(max(0.0, final_size))
+            if debug:
+                # Fail hard if risk cap would be violated.
+                check_eps = 1e-6
+                est_loss = float(exec_size) * float(risk_dbg.get("usd_loss_per_1lot_if_sl", 0.0))
+                risk_budget = float(risk_dbg.get("risk_budget_usd", 0.0))
+                if est_loss > risk_budget + check_eps:
+                    raise RuntimeError(
+                        "TASK-3N FAIL: risk cap violation "
+                        f"est_loss={est_loss:.6f} risk_budget={risk_budget:.6f} "
+                        f"size={exec_size:.6f} sl_dist={risk_dbg.get('sl_distance_price'):.6f}"
+                    )
 
         _record_decision(
             {
@@ -973,12 +1126,12 @@ def run_one_day(
             "size": float(exec_size),
             "final_size": float(exec_size),
             "guard_reason": str(guard_reason) if guard_reason else None,
-            "hold_bars": 20,
+            "hold_bars": int(hold_max),
         }
 
         if int(direction) == 0:
             debug_info["policy_hold"] += 1
-            return (0, 0.8, 0.8, 20)
+            return (0, float(tp_mult), float(sl_mult), int(hold_max))
 
         debug_info["signals_total"] += 1
         if session_ok:
@@ -1006,7 +1159,7 @@ def run_one_day(
             debug_info["guardrail_reject"] += 1
 
         if dd_stop or not allow:
-            return (0, 0.8, 0.8, 20)
+            return (0, float(tp_mult), float(sl_mult), int(hold_max))
 
         act_dir = int(direction)
         if act_dir == -1:
@@ -1017,9 +1170,9 @@ def run_one_day(
                 act_dir = 2
 
         if act_dir == 0:
-            return (0, 0.8, 0.8, 20)
+            return (0, float(tp_mult), float(sl_mult), int(hold_max))
 
-        return (act_dir, 0.8, 0.8, 20, float(final_size))
+        return (act_dir, float(tp_mult), float(sl_mult), int(hold_max), float(exec_size))
 
     for i in range(len(env.df)):
         prev_trades = len(env.ledger.trades)
@@ -2066,7 +2219,10 @@ def _select_trade_time_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str
     return out, None
 
 
-def _aggregate_trades_daily(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], int]:
+def _aggregate_trades_daily(
+    df: pd.DataFrame,
+    start_equity: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], int]:
     out = df.copy()
     out, time_col = _select_trade_time_col(out)
     if time_col is None:
@@ -2090,7 +2246,7 @@ def _aggregate_trades_daily(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Lis
     total_trades = 0
     best_day = None
     worst_day = None
-    global_balance = 0.0
+    global_balance = float(start_equity)
 
     has_regime = "regime" in out.columns
     for day in days:
@@ -2154,10 +2310,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min_size", type=float, default=0.0)
     ap.add_argument("--max_size", type=float, default=1.0)
     ap.add_argument("--deadzone", type=float, default=0.0)
+    ap.add_argument("--account_equity_start", type=float, default=500.0)
+    ap.add_argument("--risk_per_trade", type=float, default=0.02)
+    ap.add_argument("--sl_min_price", type=float, default=0.30)
+    ap.add_argument("--contract_value_per_1_0_move", type=float, default=100.0)
+    ap.add_argument("--min_lot", type=float, default=0.01)
+    ap.add_argument("--max_lot", type=float, default=0.20)
 
     ap.add_argument("--meta_risk", type=int, default=0)
     ap.add_argument("--meta_feedback", type=int, default=0)
     ap.add_argument("--meta_state_path", default="data/reports/meta_risk_state.json")
+    ap.add_argument("--regime_perf_state_path", default="data/reports/regime_perf_state.json")
+    ap.add_argument("--perf_ewm_alpha", type=float, default=0.05)
+    ap.add_argument("--perf_min_trades", type=int, default=5)
+    ap.add_argument("--meta_scale_min", type=float, default=0.6)
+    ap.add_argument("--meta_scale_max", type=float, default=1.15)
+    ap.add_argument("--meta_scale_step", type=float, default=0.08)
+    ap.add_argument("--cooldown_days", type=int, default=3)
+    ap.add_argument("--down_bad_winrate", type=float, default=0.45)
+    ap.add_argument("--up_good_winrate", type=float, default=0.55)
+    ap.add_argument("--down_bad_pnl", type=float, default=0.0)
+    ap.add_argument("--up_good_pnl", type=float, default=0.02)
+    ap.add_argument("--loss_streak_bad", type=int, default=3)
+    ap.add_argument("--dd_bad", type=float, default=0.0)
+    ap.add_argument("--small_account_threshold", type=float, default=None)
+    ap.add_argument("--small_account_floor", type=float, default=0.75)
     ap.add_argument("--regime_ledger_span", type=int, default=30)
     ap.add_argument("--regime_ledger_max_days", type=int, default=365)
 
@@ -2206,6 +2383,48 @@ def _run_live_sim_daily_once(
     debug_enabled = bool(int(args.debug)) if str(args.debug).strip() != "" else False
     debug_enabled = debug_enabled or (str(os.getenv("LIVE_SIM_DAILY_DEBUG", "")).strip() == "1")
 
+    meta_risk_enabled = int(args.meta_risk) == 1
+    meta_feedback_enabled = int(args.meta_feedback) == 1
+    small_account_threshold = args.small_account_threshold
+    if small_account_threshold is None:
+        if meta_risk_enabled:
+            small_account_threshold = float(args.account_equity_start) * 0.9
+        else:
+            small_account_threshold = 0.0
+    small_account_threshold = float(small_account_threshold) if small_account_threshold is not None else 0.0
+    small_account_enabled = bool(meta_risk_enabled and small_account_threshold > 0.0)
+    perf_engine: Optional[RegimePerfFeedbackEngine] = None
+    perf_state_path = args.regime_perf_state_path
+    perf_enabled = meta_risk_enabled and meta_feedback_enabled
+    if perf_enabled:
+        perf_cfg = RegimePerfConfig(
+            ewm_alpha=float(args.perf_ewm_alpha),
+            min_trades_per_regime=int(args.perf_min_trades),
+            min_scale=float(args.meta_scale_min),
+            max_scale=float(args.meta_scale_max),
+            max_scale_step=float(args.meta_scale_step),
+            down_bad_winrate=float(args.down_bad_winrate),
+            up_good_winrate=float(args.up_good_winrate),
+            down_bad_pnl=float(args.down_bad_pnl),
+            up_good_pnl=float(args.up_good_pnl),
+            loss_streak_bad=int(args.loss_streak_bad),
+            dd_bad=float(args.dd_bad),
+            cooldown_days=int(args.cooldown_days),
+            small_account_enabled=bool(small_account_enabled),
+            small_account_threshold=float(small_account_threshold),
+            small_account_floor=float(args.small_account_floor),
+        )
+        perf_engine = RegimePerfFeedbackEngine(cfg=perf_cfg, debug=debug_enabled)
+        if os.path.exists(perf_state_path):
+            try:
+                perf_engine.load(perf_state_path, keep_cfg=True)
+                if debug_enabled:
+                    print(f"[regime_perf] loaded state from {perf_state_path}")
+            except Exception as e:
+                print(f"[regime_perf] warn: cannot load state: {e}")
+        if read_only_state and perf_engine is not None:
+            perf_engine.read_only = True
+
     if mt5_format not in ("json", "csv"):
         mt5_format = "json"
     if mt5_mode not in ("trades", "decisions", "both"):
@@ -2250,7 +2469,10 @@ def _run_live_sim_daily_once(
     deterministic_snapshot: Optional[Dict[str, Any]] = None
 
     if mode == "trades":
-        daily_rows, equity_rows, regime_stats, total_trades = _aggregate_trades_daily(df)
+        daily_rows, equity_rows, regime_stats, total_trades = _aggregate_trades_daily(
+            df,
+            start_equity=float(args.account_equity_start),
+        )
         best_day = max(daily_rows, key=lambda r: r["day_pnl"]) if daily_rows else {}
         worst_day = min(daily_rows, key=lambda r: r["day_pnl"]) if daily_rows else {}
         ledger_first_ts = None
@@ -2267,10 +2489,49 @@ def _run_live_sim_daily_once(
             if ledger_last_ts is None:
                 ledger_last_ts = ""
 
+        equity_by_day = {str(r.get("day")): float(r.get("end_equity", 0.0)) for r in daily_rows}
+        perf_scale_changes_total = 0
+        if perf_engine is not None:
+            try:
+                df_perf, time_col = _select_trade_time_col(df.copy())
+                if time_col is not None and len(df_perf) > 0:
+                    df_perf["day"] = df_perf[time_col].dt.date.astype(str)
+                    for day_key in sorted(df_perf["day"].unique().tolist()):
+                        g = df_perf[df_perf["day"] == day_key]
+                        update_info = perf_engine.update_from_trades(
+                            g,
+                            day_key=day_key,
+                            account_equity=equity_by_day.get(str(day_key)),
+                        )
+                        perf_scale_changes_total += len(update_info.get("scale_changes", []))
+                        _debug_perf_update(debug_enabled, day_key, update_info, perf_engine)
+                else:
+                    update_info = perf_engine.update_from_trades([], day_key=None, account_equity=None)
+                    perf_scale_changes_total += len(update_info.get("scale_changes", []))
+                    _debug_perf_update(debug_enabled, None, update_info, perf_engine)
+            except Exception as e:
+                print(f"[regime_perf] warn: update failed: {e}")
+
+        if perf_engine is not None:
+            regime_stats["regimes"] = perf_engine.summary().get("regimes", {})
+            regime_stats["regime_perf_meta"] = {
+                "version": int(perf_engine.cfg.version),
+                "last_update_ts": perf_engine.last_update_ts,
+                "state_path": perf_state_path,
+            }
+
         summary = {
             "model_path": args.model_path,
             "mode": "trades_agg",
             "power": float(args.power),
+            "config": {
+                "account_equity_start": float(args.account_equity_start),
+                "risk_per_trade": float(args.risk_per_trade),
+                "sl_min_price": float(args.sl_min_price),
+                "contract_value_per_1_0_move": float(args.contract_value_per_1_0_move),
+                "min_lot": float(args.min_lot),
+                "max_lot": float(args.max_lot),
+            },
             "execution": execution_settings,
             "session": session_settings,
             "fail_safe": {
@@ -2290,6 +2551,26 @@ def _run_live_sim_daily_once(
             "best_day": best_day or {},
             "worst_day": worst_day or {},
             "daily_table": daily_rows,
+        }
+
+        meta_note = "regime_perf_feedback_disabled"
+        meta_regimes = []
+        meta_global_scale = None
+        if perf_engine is not None:
+            meta_regimes = perf_engine.regimes_seen()
+            meta_global_scale = perf_engine.global_meta_scale()
+            if int(total_trades) == 0:
+                meta_note = "no_trades"
+            elif perf_scale_changes_total == 0:
+                meta_note = "no_scale_changes"
+            else:
+                meta_note = "ok"
+        summary["meta"] = {
+            "meta_risk_enabled": int(args.meta_risk),
+            "meta_feedback_enabled": int(args.meta_feedback),
+            "regimes_seen": meta_regimes,
+            "global_meta_scale": meta_global_scale,
+            "notes": meta_note,
         }
 
         ledger_state = None
@@ -2323,6 +2604,10 @@ def _run_live_sim_daily_once(
             write_equity_csv(out_equity, equity_rows)
             write_summary_json(out_summary, summary)
             write_regime_json(out_regime, regime_stats)
+            if perf_engine is not None:
+                if perf_engine.save(perf_state_path):
+                    if debug_enabled:
+                        print(f"[regime_perf] saved state to {perf_state_path}")
 
         if mt5_export:
             trades_export = df.copy()
@@ -2473,6 +2758,11 @@ def _run_live_sim_daily_once(
         "spread_spike_cap": float(spread_spike_cap_used),
         "spread_open_cap": float(spread_open_cap_used),
         "atr_period": int(args.atr_period),
+        "risk_per_trade": float(args.risk_per_trade),
+        "sl_min_price": float(args.sl_min_price),
+        "contract_value_per_1_0_move": float(args.contract_value_per_1_0_move),
+        "min_lot": float(args.min_lot),
+        "max_lot": float(args.max_lot),
     }
     session_filter = None if no_session_filter else _make_session_filter(session_settings)
 
@@ -2488,10 +2778,11 @@ def _run_live_sim_daily_once(
     equity_rows: List[Dict[str, Any]] = []
     regime_stats: Dict[str, Any] = {"days": []}
 
-    global_balance = 0.0
+    global_balance = float(args.account_equity_start)
     best_day = None
     worst_day = None
     total_trades = 0
+    perf_scale_changes_total = 0
     breakdown_totals = {
         "bars_total": int(bars_total_raw),
         "bars_after_time_parse": int(len(df)),
@@ -2526,6 +2817,7 @@ def _run_live_sim_daily_once(
             weighter=weighter,
             meta_state=meta_state,
             meta_feedback=bool(int(args.meta_feedback)),
+            regime_feedback=perf_engine,
             session_filter=session_filter,
             cfg=cfg,
             global_balance=global_balance,
@@ -2538,6 +2830,16 @@ def _run_live_sim_daily_once(
             collect_decisions=collect_decisions,
             collect_trade_meta=mt5_collect_trades,
         )
+        start_equity = float(global_balance)
+        end_equity = float(global_balance + day_pnl)
+        if perf_engine is not None:
+            update_info = perf_engine.update_from_trades(
+                trades_df,
+                day_key=day,
+                account_equity=end_equity,
+            )
+            perf_scale_changes_total += len(update_info.get("scale_changes", []))
+            _debug_perf_update(debug_enabled, day, update_info, perf_engine)
         if mt5_trades_frames is not None and trades_df is not None and len(trades_df) > 0:
             mt5_trades_frames.append(trades_df)
             if mt5_trade_meta is not None:
@@ -2562,9 +2864,6 @@ def _run_live_sim_daily_once(
         breakdown_totals["guardrail_reject"] += int(dbg.get("guardrail_reject", 0))
         breakdown_totals["policy_hold"] += int(dbg.get("policy_hold", 0))
         breakdown_totals["size_zero"] += int(dbg.get("size_zero", 0))
-
-        start_equity = float(global_balance)
-        end_equity = float(global_balance + day_pnl)
 
         row = {
             "day": day,
@@ -2601,6 +2900,14 @@ def _run_live_sim_daily_once(
         if isinstance(regime_counts, dict) and regime_counts:
             regime_day["regime_counts"] = regime_counts
         regime_stats["days"].append(regime_day)
+
+    if perf_engine is not None:
+        regime_stats["regimes"] = perf_engine.summary().get("regimes", {})
+        regime_stats["regime_perf_meta"] = {
+            "version": int(perf_engine.cfg.version),
+            "last_update_ts": perf_engine.last_update_ts,
+            "state_path": perf_state_path,
+        }
 
     deterministic_regime_counts = _aggregate_regime_counts(regime_stats)
     meta_scale_history_len = _meta_scale_history_len(deterministic_decisions)
@@ -2702,6 +3009,14 @@ def _run_live_sim_daily_once(
         "model_path": args.model_path,
         "mode": "regime_bank",
         "power": float(args.power),
+        "config": {
+            "account_equity_start": float(args.account_equity_start),
+            "risk_per_trade": float(args.risk_per_trade),
+            "sl_min_price": float(args.sl_min_price),
+            "contract_value_per_1_0_move": float(args.contract_value_per_1_0_move),
+            "min_lot": float(args.min_lot),
+            "max_lot": float(args.max_lot),
+        },
         "execution": execution_settings,
         "session": session_settings,
         "fail_safe": {
@@ -2721,6 +3036,26 @@ def _run_live_sim_daily_once(
         "best_day": best_day or {},
         "worst_day": worst_day or {},
         "daily_table": daily_rows,
+    }
+
+    meta_note = "regime_perf_feedback_disabled"
+    meta_regimes = []
+    meta_global_scale = None
+    if perf_engine is not None:
+        meta_regimes = perf_engine.regimes_seen()
+        meta_global_scale = perf_engine.global_meta_scale()
+        if int(total_trades) == 0:
+            meta_note = "no_trades"
+        elif perf_scale_changes_total == 0:
+            meta_note = "no_scale_changes"
+        else:
+            meta_note = "ok"
+    summary["meta"] = {
+        "meta_risk_enabled": int(args.meta_risk),
+        "meta_feedback_enabled": int(args.meta_feedback),
+        "regimes_seen": meta_regimes,
+        "global_meta_scale": meta_global_scale,
+        "notes": meta_note,
     }
 
     ledger_state = None
@@ -2754,6 +3089,10 @@ def _run_live_sim_daily_once(
         write_equity_csv(out_equity, equity_rows)
         write_summary_json(out_summary, summary)
         write_regime_json(out_regime, regime_stats)
+        if perf_engine is not None:
+            if perf_engine.save(perf_state_path):
+                if debug_enabled:
+                    print(f"[regime_perf] saved state to {perf_state_path}")
 
     if mt5_export:
         trades_export_df = pd.DataFrame()
