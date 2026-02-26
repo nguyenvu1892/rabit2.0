@@ -132,6 +132,7 @@ class RegimeLedgerState:
         daily_rows: Optional[List[Dict[str, Any]]],
         regime_stats: Optional[Dict[str, Any]],
         debug: bool = False,
+        last_update_ts: Optional[str] = None,
     ) -> None:
         if not daily_rows:
             return
@@ -178,7 +179,10 @@ class RegimeLedgerState:
         if max_days > 0 and len(history) > max_days:
             history = history[-max_days:]
         self.history = history
-        self.last_update_ts = datetime.datetime.utcnow().isoformat()
+        if last_update_ts is not None:
+            self.last_update_ts = str(last_update_ts)
+        else:
+            self.last_update_ts = datetime.datetime.utcnow().isoformat()
         if debug:
             print(f"[regime_ledger] updated history={len(self.history)} max_days={max_days}")
 

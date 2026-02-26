@@ -12,11 +12,13 @@ import os
 import re
 import json
 import argparse
+import datetime
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 
+from scripts import deterministic_utils as det
 from rabit.data.feature_builder import FeatureBuilder, FeatureConfig
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
@@ -1208,6 +1210,76 @@ def write_regime_json(path: str, regime_stats: Dict[str, Any]) -> None:
         json.dump(regime_stats, f, ensure_ascii=False, indent=2)
 
 
+def _aggregate_regime_counts(regime_stats: Dict[str, Any]) -> Dict[str, int]:
+    totals: Dict[str, int] = {}
+    if not isinstance(regime_stats, dict):
+        return totals
+    days = regime_stats.get("days", [])
+    if not isinstance(days, list):
+        return totals
+    for day_info in days:
+        if not isinstance(day_info, dict):
+            continue
+        counts = day_info.get("regime_counts", {})
+        if not isinstance(counts, dict):
+            continue
+        for k, v in counts.items():
+            key = str(k)
+            try:
+                totals[key] = totals.get(key, 0) + int(v)
+            except Exception:
+                continue
+    return totals
+
+
+def _meta_scale_history_len(decisions: Optional[List[Dict[str, Any]]]) -> int:
+    if not decisions:
+        return 0
+    total = 0
+    for row in decisions:
+        if isinstance(row, dict) and "meta_scale" in row:
+            total += 1
+    return int(total)
+
+
+def _build_deterministic_snapshot(
+    base: Optional[Dict[str, Any]],
+    payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if base is None:
+        return None
+    snapshot = dict(base)
+    snapshot.update(payload)
+    snapshot["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return snapshot
+
+
+def _run_deterministic_validation(
+    enabled: bool,
+    snapshot_path: str,
+    snapshot: Optional[Dict[str, Any]],
+) -> None:
+    if not enabled or snapshot is None:
+        return
+
+    print(f"[deterministic] input_hash={snapshot.get('input_hash')}")
+    print(f"[deterministic] equity_hash={snapshot.get('equity_hash')}")
+    print(f"[deterministic] total_pnl={snapshot.get('total_pnl')}")
+
+    existing = det.load_json(snapshot_path)
+    if existing:
+        diffs = det.diff_snapshots(existing, snapshot, ignore_keys={"timestamp"})
+        if diffs:
+            for diff in diffs:
+                print(f"[deterministic] diff {diff}")
+            print("[deterministic] STATUS=FAIL")
+            raise RuntimeError("TASK-3M FAIL: deterministic violation")
+        print("[deterministic] STATUS=PASS")
+        return
+
+    det.save_json(snapshot_path, snapshot)
+    print("[deterministic] STATUS=PASS")
+
 def _value_present(value: Any) -> bool:
     if value is None:
         return False
@@ -1647,11 +1719,17 @@ def update_regime_ledger(
     span: int,
     max_days: int,
     debug: bool = False,
+    last_update_ts: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     ledger_path = os.path.join(out_dir, "regime_ledger.json")
     cfg = RegimeLedgerConfig(span=int(span), max_days=int(max_days))
     state = RegimeLedgerState.load(ledger_path, cfg=cfg)
-    state.update_from_daily_outputs(daily_rows, regime_stats, debug=debug)
+    state.update_from_daily_outputs(
+        daily_rows,
+        regime_stats,
+        debug=debug,
+        last_update_ts=last_update_ts,
+    )
     state.save(ledger_path)
     return state.compact_summary()
 
@@ -1906,8 +1984,10 @@ def main() -> None:
     ap.add_argument("--mt5_out_dir", default=None)
     ap.add_argument("--mt5_format", default="json")
     ap.add_argument("--mt5_mode", default="trades")
+    ap.add_argument("--deterministic_check", type=int, default=0)
 
     args = ap.parse_args()
+    deterministic_enabled = _parse_bool_flag(args.deterministic_check, default=False)
 
     mt5_export = _parse_bool_flag(args.mt5_export, default=False)
     mt5_format = str(args.mt5_format or "json").strip().lower()
@@ -1918,6 +1998,8 @@ def main() -> None:
     out_equity = os.path.join(args.out_dir, "live_daily_equity.csv")
     out_summary = os.path.join(args.out_dir, "live_daily_summary.json")
     out_regime = os.path.join(args.out_dir, "live_daily_regime.json")
+    regime_ledger_path = os.path.join(args.out_dir, "regime_ledger.json")
+    deterministic_snapshot_path = os.path.join(args.out_dir, "deterministic_snapshot.json")
 
     debug_enabled = bool(int(args.debug)) if str(args.debug).strip() != "" else False
     debug_enabled = debug_enabled or (str(os.getenv("LIVE_SIM_DAILY_DEBUG", "")).strip() == "1")
@@ -1928,6 +2010,7 @@ def main() -> None:
         mt5_mode = "trades"
     mt5_collect_trades = bool(mt5_export)
     mt5_collect_decisions = bool(mt5_export and mt5_mode in ("decisions", "both"))
+    collect_decisions = bool(mt5_collect_decisions or deterministic_enabled)
     if mt5_export:
         ensure_dir(mt5_out_dir)
 
@@ -1958,10 +2041,43 @@ def main() -> None:
     no_spread_filter = _parse_bool_flag(args.no_spread_filter, default=False)
     execution_settings = _default_execution_settings()
 
+    deterministic_ctx: Optional[Dict[str, Any]] = None
+    if deterministic_enabled:
+        args_payload = vars(args).copy()
+        args_json = det.stable_json_dumps(args_payload)
+        args_hash = det.sha256_text(args_json)
+        seed = execution_settings.get("seed", 7) if isinstance(execution_settings, dict) else 7
+        input_hash = det.sha256_file(args.csv)
+        model_hash = det.sha256_file(args.model_path)
+        meta_state_hash = "skipped"
+        if int(args.meta_risk) == 1:
+            meta_state_hash = det.sha256_file(args.meta_state_path)
+        deterministic_ctx = {
+            "input_hash": input_hash,
+            "model_hash": model_hash,
+            "args_hash": args_hash,
+            "args_json": args_json,
+            "seed": int(seed),
+            "meta_state_hash": meta_state_hash,
+        }
+
     if mode == "trades":
         daily_rows, equity_rows, regime_stats, total_trades = _aggregate_trades_daily(df)
         best_day = max(daily_rows, key=lambda r: r["day_pnl"]) if daily_rows else {}
         worst_day = min(daily_rows, key=lambda r: r["day_pnl"]) if daily_rows else {}
+        ledger_first_ts = None
+        ledger_last_ts = None
+        if deterministic_enabled:
+            try:
+                df_ts, time_col = _select_trade_time_col(df.copy())
+                if time_col is not None and len(df_ts) > 0:
+                    ledger_first_ts = _format_ts(df_ts[time_col].iloc[0])
+                    ledger_last_ts = _format_ts(df_ts[time_col].iloc[-1])
+            except Exception:
+                ledger_first_ts = None
+                ledger_last_ts = None
+            if ledger_last_ts is None:
+                ledger_last_ts = ""
 
         summary = {
             "model_path": args.model_path,
@@ -1996,6 +2112,7 @@ def main() -> None:
                 span=int(args.regime_ledger_span),
                 max_days=int(args.regime_ledger_max_days),
                 debug=debug_enabled,
+                last_update_ts=ledger_last_ts if deterministic_enabled else None,
             )
             summary["regime_ledger"] = ledger_summary or {}
 
@@ -2033,6 +2150,34 @@ def main() -> None:
                 debug=debug_enabled,
             )
 
+        if deterministic_enabled:
+            first_ts = ledger_first_ts
+            last_ts = ledger_last_ts if ledger_last_ts else None
+            regime_counts = _aggregate_regime_counts(regime_stats)
+            snapshot_payload = {
+                "equity_hash": det.sha256_file(out_equity),
+                "summary_hash": det.sha256_file(out_summary),
+                "regime_hash": det.sha256_file(out_regime),
+                "regime_ledger_hash": det.sha256_file(regime_ledger_path) if int(args.meta_risk) == 1 else "skipped",
+                "total_pnl": float(summary.get("total_pnl", 0.0)),
+                "total_trades": int(total_trades),
+                "days": int(len(daily_rows)),
+                "first_ts": first_ts,
+                "last_ts": last_ts,
+                "feature_shape": None,
+                "model_n_features": None,
+                "data_n_features": None,
+                "n_features_match": None,
+                "regime_counts": regime_counts,
+                "meta_scale_history_len": 0,
+            }
+            snapshot = _build_deterministic_snapshot(deterministic_ctx, snapshot_payload)
+            _run_deterministic_validation(
+                deterministic_enabled,
+                deterministic_snapshot_path,
+                snapshot,
+            )
+
         print(f"Saved: {out_equity} {out_summary} {out_regime}")
         print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
         return
@@ -2052,6 +2197,9 @@ def main() -> None:
 
     model = load_regime_bank(args.model_path, debug=debug_enabled)
     model_n_features = _infer_model_n_features(model)
+    feature_shape: Optional[List[int]] = None
+    data_n_features: Optional[int] = None
+    n_features_match: Optional[bool] = None
 
     legacy_features = bool(int(args.legacy_features))
     if legacy_features:
@@ -2076,6 +2224,8 @@ def main() -> None:
                 "Feature dimension mismatch: FeatureBuilder produced "
                 f"{data_n_features} < model_n_features={model_n_features}"
             )
+        n_features_match = int(data_n_features) == int(model_n_features)
+        feature_shape = [int(X_all.shape[0]), int(X_all.shape[1])]
         _debug_print(
             debug_enabled,
             f"[debug] feature_source=TradingEnv feature_dims model={model_n_features} "
@@ -2119,6 +2269,11 @@ def main() -> None:
 
     df["day"] = df["time"].dt.date.astype(str)
     days = df["day"].unique().tolist()
+    ledger_last_ts = None
+    if deterministic_enabled:
+        ledger_last_ts = _format_ts(df["time"].iloc[-1]) if len(df) > 0 else ""
+        if ledger_last_ts is None:
+            ledger_last_ts = ""
 
     daily_rows: List[Dict[str, Any]] = []
     equity_rows: List[Dict[str, Any]] = []
@@ -2148,6 +2303,7 @@ def main() -> None:
     mt5_trades_frames: Optional[List[pd.DataFrame]] = [] if mt5_collect_trades else None
     mt5_trade_meta: Optional[List[Dict[str, Any]]] = [] if mt5_collect_trades else None
     mt5_decisions: Optional[List[Dict[str, Any]]] = [] if mt5_collect_decisions else None
+    deterministic_decisions: Optional[List[Dict[str, Any]]] = [] if deterministic_enabled else None
 
     for day in days:
         mask = df["day"] == day
@@ -2170,7 +2326,7 @@ def main() -> None:
             bypass_session=no_session_filter,
             bypass_spread=no_spread_filter,
             debug=debug_enabled,
-            collect_decisions=mt5_collect_decisions,
+            collect_decisions=collect_decisions,
             collect_trade_meta=mt5_collect_trades,
         )
         if mt5_trades_frames is not None and trades_df is not None and len(trades_df) > 0:
@@ -2179,10 +2335,12 @@ def main() -> None:
                 day_meta = dbg.get("trade_meta", [])
                 if isinstance(day_meta, list) and day_meta:
                     mt5_trade_meta.extend(day_meta)
-        if mt5_decisions is not None:
-            day_decisions = dbg.get("decision_rows", [])
-            if isinstance(day_decisions, list) and day_decisions:
+        day_decisions = dbg.get("decision_rows", [])
+        if isinstance(day_decisions, list) and day_decisions:
+            if mt5_decisions is not None:
                 mt5_decisions.extend(day_decisions)
+            if deterministic_decisions is not None:
+                deterministic_decisions.extend(day_decisions)
         total_trades += int(dbg.get("allowed", 0))
         breakdown_totals["bars_after_session_filter"] += int(dbg.get("bars_after_session_filter", 0))
         breakdown_totals["bars_after_spread_filter"] += int(dbg.get("bars_after_spread_filter", 0))
@@ -2234,6 +2392,9 @@ def main() -> None:
         if isinstance(regime_counts, dict) and regime_counts:
             regime_day["regime_counts"] = regime_counts
         regime_stats["days"].append(regime_day)
+
+    deterministic_regime_counts = _aggregate_regime_counts(regime_stats)
+    meta_scale_history_len = _meta_scale_history_len(deterministic_decisions)
 
     if int(total_trades) == 0:
         if int(breakdown_totals.get("signals_total", 0)) == 0:
@@ -2361,6 +2522,7 @@ def main() -> None:
             span=int(args.regime_ledger_span),
             max_days=int(args.regime_ledger_max_days),
             debug=debug_enabled,
+            last_update_ts=ledger_last_ts if deterministic_enabled else None,
         )
         summary["regime_ledger"] = ledger_summary or {}
 
@@ -2397,6 +2559,33 @@ def main() -> None:
             no_trades_reason=None,
             no_decisions_reason=no_decisions_reason,
             debug=debug_enabled,
+        )
+
+    if deterministic_enabled:
+        first_ts = _format_ts(df["time"].iloc[0]) if len(df) > 0 else None
+        last_ts = _format_ts(df["time"].iloc[-1]) if len(df) > 0 else None
+        snapshot_payload = {
+            "equity_hash": det.sha256_file(out_equity),
+            "summary_hash": det.sha256_file(out_summary),
+            "regime_hash": det.sha256_file(out_regime),
+            "regime_ledger_hash": det.sha256_file(regime_ledger_path) if int(args.meta_risk) == 1 else "skipped",
+            "total_pnl": float(summary.get("total_pnl", 0.0)),
+            "total_trades": int(total_trades),
+            "days": int(len(daily_rows)),
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "feature_shape": feature_shape,
+            "model_n_features": int(model_n_features) if model_n_features is not None else None,
+            "data_n_features": int(data_n_features) if data_n_features is not None else None,
+            "n_features_match": n_features_match,
+            "regime_counts": deterministic_regime_counts,
+            "meta_scale_history_len": int(meta_scale_history_len),
+        }
+        snapshot = _build_deterministic_snapshot(deterministic_ctx, snapshot_payload)
+        _run_deterministic_validation(
+            deterministic_enabled,
+            deterministic_snapshot_path,
+            snapshot,
         )
 
     print(f"Saved: {out_equity} {out_summary} {out_regime}")
