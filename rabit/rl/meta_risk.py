@@ -81,6 +81,7 @@ class MetaRiskConfig:
     up_power: float
     hysteresis: float
     cooldown_trades: int
+    cooldown_days: int
     global_fallback_scale: float
     target_pf: float
     target_return: float
@@ -94,10 +95,10 @@ class MetaRiskConfig:
     def __init__(
         self,
         min_trades_per_regime: int = 50,
-        ewma_alpha: float = 0.10,
+        ewma_alpha: float = 0.25,
         score_clip: float = 3.0,
-        min_scale: float = 0.40,
-        max_scale: float = 1.20,
+        min_scale: float = 0.60,
+        max_scale: float = 1.30,
         k: float = 1.0,
         daily_dd_limit: float = 3.0,
         loss_streak_limit: int = 5,
@@ -108,10 +109,13 @@ class MetaRiskConfig:
         cap: Optional[float] = None,
         scale_min: Optional[float] = None,
         scale_max: Optional[float] = None,
+        meta_scale_min: Optional[float] = None,
+        meta_scale_max: Optional[float] = None,
         down_power: float = 1.20,
         up_power: float = 0.80,
         hysteresis: float = 0.05,
         cooldown_trades: int = 5,
+        cooldown_days: int = 2,
         global_fallback_scale: float = 1.0,
         target_pf: float = 1.02,
         target_return: float = 0.0,
@@ -128,6 +132,10 @@ class MetaRiskConfig:
             min_scale = scale_min
         if scale_max is not None:
             max_scale = scale_max
+        if meta_scale_min is not None:
+            min_scale = meta_scale_min
+        if meta_scale_max is not None:
+            max_scale = meta_scale_max
         if floor is not None:
             min_scale = floor
         if cap is not None:
@@ -154,6 +162,7 @@ class MetaRiskConfig:
         self.up_power = float(up_power)
         self.hysteresis = float(hysteresis)
         self.cooldown_trades = int(cooldown_trades)
+        self.cooldown_days = int(cooldown_days)
         self.global_fallback_scale = float(global_fallback_scale)
         self.target_pf = float(target_pf)
         self.target_return = float(target_return)
@@ -178,6 +187,14 @@ class MetaRiskConfig:
     def cap(self) -> float:
         return self.max_scale
 
+    @property
+    def meta_scale_min(self) -> float:
+        return self.min_scale
+
+    @property
+    def meta_scale_max(self) -> float:
+        return self.max_scale
+
 
 @dataclass
 class RegimeStats:
@@ -191,6 +208,7 @@ class RegimeStats:
     last_update_ts: Optional[str] = None
     last_scale: float = 1.0
     last_scale_update_n: int = 0
+    last_scale_update_date: Optional[str] = None
     last_meta_reason: Optional[str] = None
     ewma_return: float = 0.0
     ewma_vol: float = 0.0
@@ -208,6 +226,10 @@ def _normalize_cfg_kwargs(cfg_data: Dict[str, Any]) -> Dict[str, Any]:
         cfg["min_scale"] = cfg["floor"]
     if "cap" in cfg and "max_scale" not in cfg:
         cfg["max_scale"] = cfg["cap"]
+    if "meta_scale_min" in cfg and "min_scale" not in cfg:
+        cfg["min_scale"] = cfg["meta_scale_min"]
+    if "meta_scale_max" in cfg and "max_scale" not in cfg:
+        cfg["max_scale"] = cfg["meta_scale_max"]
 
     allowed = {
         "min_trades_per_regime",
@@ -226,6 +248,7 @@ def _normalize_cfg_kwargs(cfg_data: Dict[str, Any]) -> Dict[str, Any]:
         "up_power",
         "hysteresis",
         "cooldown_trades",
+        "cooldown_days",
         "global_fallback_scale",
         "target_pf",
         "target_return",
@@ -238,6 +261,8 @@ def _normalize_cfg_kwargs(cfg_data: Dict[str, Any]) -> Dict[str, Any]:
         "alpha",
         "floor",
         "cap",
+        "meta_scale_min",
+        "meta_scale_max",
     }
     return {k: cfg[k] for k in allowed if k in cfg}
 
@@ -331,13 +356,39 @@ class MetaRiskState:
         return "ok"
 
     def _scale_bounds(self) -> Tuple[float, float]:
-        min_scale = _safe_float(getattr(self.cfg, "scale_min", None), _safe_float(getattr(self.cfg, "min_scale", 0.0), 0.0))
-        max_scale = _safe_float(getattr(self.cfg, "scale_max", None), _safe_float(getattr(self.cfg, "max_scale", 1.0), 1.0))
+        min_scale = _safe_float(
+            getattr(self.cfg, "meta_scale_min", None),
+            _safe_float(getattr(self.cfg, "scale_min", None), _safe_float(getattr(self.cfg, "min_scale", 0.0), 0.0)),
+        )
+        max_scale = _safe_float(
+            getattr(self.cfg, "meta_scale_max", None),
+            _safe_float(getattr(self.cfg, "scale_max", None), _safe_float(getattr(self.cfg, "max_scale", 1.0), 1.0)),
+        )
         if min_scale <= 0.0:
             min_scale = _NONZERO_EPS
         if max_scale < min_scale:
             max_scale = min_scale
         return float(min_scale), float(max_scale)
+
+    def _performance_hysteresis_bounds(self) -> Tuple[float, float]:
+        gap = abs(_safe_float(getattr(self.cfg, "hysteresis", 0.0), 0.0))
+        lower = -gap
+        upper = gap
+        if upper < lower:
+            upper = lower
+        return float(lower), float(upper)
+
+    def _cooldown_days_elapsed(self, last_date: Optional[str], current_date: Optional[str]) -> bool:
+        cooldown_days = max(0, _safe_int(getattr(self.cfg, "cooldown_days", 0), 0))
+        if cooldown_days <= 0:
+            return True
+        if not last_date or not current_date:
+            return True
+        last_ord = _date_ordinal(last_date)
+        cur_ord = _date_ordinal(current_date)
+        if last_ord is None or cur_ord is None:
+            return True
+        return (cur_ord - last_ord) >= cooldown_days
 
     def _global_scale_bounds(self) -> Tuple[float, float]:
         min_scale = _safe_float(
@@ -480,9 +531,8 @@ class MetaRiskState:
         scale, _reason = self.global_scale_with_reason(update_state=False)
         return float(scale)
 
-    def _scale_from_stats(self, st: RegimeStats) -> float:
+    def _scale_from_perf(self, perf: float) -> float:
         min_scale, max_scale = self._scale_bounds()
-        perf = self._performance_score(st)
         down_power = max(0.01, _safe_float(getattr(self.cfg, "down_power", 1.0), 1.0))
         up_power = max(0.01, _safe_float(getattr(self.cfg, "up_power", 1.0), 1.0))
         if perf < 0.0:
@@ -491,6 +541,10 @@ class MetaRiskState:
             scale = 1.0 + (perf ** up_power) * (max_scale - 1.0)
         scale = _clamp(scale, min_scale, max_scale)
         return self._apply_dd_soft_limit(scale)
+
+    def _scale_from_stats(self, st: RegimeStats) -> float:
+        perf = self._performance_score(st)
+        return self._scale_from_perf(perf)
 
     def _compute_scale(self, regime: str, st: Optional[RegimeStats], update_state: bool) -> Tuple[float, str]:
         min_scale, max_scale = self._scale_bounds()
@@ -508,13 +562,31 @@ class MetaRiskState:
         if n_trades < min_trades:
             return base, "fallback_min_trades"
 
-        candidate = self._scale_from_stats(st)
+        perf = self._performance_score(st)
+        candidate = self._scale_from_perf(perf)
         last_scale = _safe_float(getattr(st, "last_scale", base), base)
         last_scale = _clamp(last_scale, min_scale, max_scale)
+
+        lower_thr, upper_thr = self._performance_hysteresis_bounds()
+        if perf <= lower_thr:
+            if candidate >= last_scale:
+                return last_scale, "hold_hysteresis_down"
+        elif perf >= upper_thr:
+            if candidate <= last_scale:
+                return last_scale, "hold_hysteresis_up"
+        else:
+            return last_scale, "hold_hysteresis_gap"
 
         hysteresis = max(0.0, _safe_float(getattr(self.cfg, "hysteresis", 0.0), 0.0))
         if abs(candidate - last_scale) < hysteresis:
             return last_scale, "hold_hysteresis"
+
+        current_date = self.daily_date
+        if not current_date and st.last_update_ts:
+            current_date = _extract_date_key(st.last_update_ts)
+        last_scale_date = _normalize_optional_ts(getattr(st, "last_scale_update_date", None))
+        if not self._cooldown_days_elapsed(last_scale_date, current_date):
+            return last_scale, "hold_cooldown_days"
 
         cooldown = max(0, _safe_int(getattr(self.cfg, "cooldown_trades", 0), 0))
         last_update_n = _safe_int(getattr(st, "last_scale_update_n", 0), 0)
@@ -526,6 +598,8 @@ class MetaRiskState:
         if update_state:
             st.last_scale = candidate
             st.last_scale_update_n = n_trades
+            if current_date:
+                st.last_scale_update_date = str(current_date)
             st.last_meta_reason = reason
         return candidate, reason
 
@@ -736,6 +810,7 @@ class MetaRiskState:
             st["last_update_ts"] = _normalize_optional_ts(st.get("last_update_ts"))
             st["last_scale"] = _safe_float(st.get("last_scale", 1.0), 1.0)
             st["last_scale_update_n"] = _safe_int(st.get("last_scale_update_n", 0), 0)
+            st["last_scale_update_date"] = _normalize_optional_ts(st.get("last_scale_update_date"))
             if st.get("last_meta_reason") is not None:
                 st["last_meta_reason"] = str(st.get("last_meta_reason"))
             else:
@@ -830,11 +905,14 @@ class MetaRiskState:
                 min_scale, max_scale = state._scale_bounds()
                 stats.last_scale = _clamp(stats.last_scale, min_scale, max_scale)
                 stats.last_scale_update_n = _safe_int(stats.last_scale_update_n, 0)
+                stats.last_scale_update_date = _normalize_optional_ts(stats.last_scale_update_date)
                 if stats.last_meta_reason is not None:
                     stats.last_meta_reason = str(stats.last_meta_reason)
                 stats.ewma_return = _safe_float(stats.ewma_return, stats.ewma_pnl)
                 stats.ewma_vol = _safe_float(stats.ewma_vol, stats.ewma_abs_pnl)
                 stats.ewma_winrate = _safe_float(stats.ewma_winrate, stats.ewma_win)
+                if stats.last_scale_update_date is None and stats.last_update_ts:
+                    stats.last_scale_update_date = _extract_date_key(stats.last_update_ts)
                 state.regimes[str(key)] = stats
 
         state.daily_equity_peak = float(data.get("daily_equity_peak", 0.0) or 0.0)
