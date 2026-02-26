@@ -1242,43 +1242,233 @@ def _meta_scale_history_len(decisions: Optional[List[Dict[str, Any]]]) -> int:
     return int(total)
 
 
+_DET_REGIME_LEDGER_EXCLUDE = {"last_update_ts"}
+
+
+def _stable_json_dumps_canonical(data: Any) -> str:
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _canonicalize_regime_ledger(raw: Any) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    # Deterministic hashing excludes fields that vary per run (e.g. last_update_ts).
+    meta: Dict[str, Any] = {
+        "included_fields": ["config", "start_day", "end_day", "history", "regimes"],
+        "excluded_fields": sorted(_DET_REGIME_LEDGER_EXCLUDE),
+    }
+    if not isinstance(raw, dict):
+        meta["status"] = "missing_or_invalid"
+        return None, meta
+
+    config_raw = raw.get("config", {})
+    config_out: Dict[str, Any] = {}
+    if isinstance(config_raw, dict):
+        span = _safe_int_or_none(config_raw.get("span"))
+        max_days = _safe_int_or_none(config_raw.get("max_days"))
+        alpha = _safe_float(config_raw.get("alpha", 0.0), 0.0)
+        config_out = {
+            "span": int(span) if span is not None else 0,
+            "max_days": int(max_days) if max_days is not None else 0,
+            "alpha": float(alpha),
+        }
+
+    history_raw = raw.get("history", [])
+    history_out: List[Dict[str, Any]] = []
+    if isinstance(history_raw, list):
+        for rec in history_raw:
+            if not isinstance(rec, dict):
+                continue
+            day = _safe_optional_str(rec.get("day"))
+            if not day:
+                continue
+            history_out.append(
+                {
+                    "day": day,
+                    "regime": _safe_str(rec.get("regime"), default="unknown"),
+                    "day_pnl": _safe_float(rec.get("day_pnl", 0.0), 0.0),
+                    "start_equity": _safe_float(rec.get("start_equity", 0.0), 0.0),
+                    "end_equity": _safe_float(rec.get("end_equity", 0.0), 0.0),
+                    "intraday_dd": _safe_float(rec.get("intraday_dd", 0.0), 0.0),
+                    "end_loss_streak": int(_safe_int_or_none(rec.get("end_loss_streak", 0)) or 0),
+                }
+            )
+    history_out.sort(key=lambda r: str(r.get("day", "")))
+
+    regimes_out: Dict[str, Dict[str, Any]] = {}
+    regimes_raw = raw.get("regimes", {})
+    if isinstance(regimes_raw, dict):
+        for regime_key, stats in regimes_raw.items():
+            if not isinstance(stats, dict):
+                continue
+            regimes_out[str(regime_key)] = {
+                "winrate_ewm": _safe_float(stats.get("winrate_ewm", 0.0), 0.0),
+                "avg_pnl_ewm": _safe_float(stats.get("avg_pnl_ewm", 0.0), 0.0),
+                "loss_streak_ewm": _safe_float(stats.get("loss_streak_ewm", 0.0), 0.0),
+                "n_days": int(_safe_int_or_none(stats.get("n_days", 0)) or 0),
+                "last_day": _safe_optional_str(stats.get("last_day")),
+            }
+
+    start_day = _safe_optional_str(raw.get("start_day"))
+    end_day = _safe_optional_str(raw.get("end_day"))
+    if start_day is None and history_out:
+        start_day = history_out[0].get("day")
+    if end_day is None and history_out:
+        end_day = history_out[-1].get("day")
+
+    meta.update(
+        {
+            "history_len": int(len(history_out)),
+            "regime_keys": sorted(regimes_out.keys()),
+            "start_day": start_day,
+            "end_day": end_day,
+        }
+    )
+
+    canonical = {
+        "config": config_out,
+        "start_day": start_day,
+        "end_day": end_day,
+        "history": history_out,
+        "regimes": regimes_out,
+    }
+    return canonical, meta
+
+
+def _hash_regime_ledger_dict(raw: Any, debug: bool = False) -> Tuple[str, Dict[str, Any]]:
+    canonical, meta = _canonicalize_regime_ledger(raw)
+    if canonical is None:
+        status = "missing"
+        if isinstance(raw, dict):
+            status = "invalid"
+        meta["status"] = status
+        if debug:
+            print(f"[deterministic] regime_ledger hash skipped: status={status}")
+        return status, meta
+
+    if debug:
+        print(
+            "[deterministic] regime_ledger canonicalize: sort_keys=True separators=(',', ':') "
+            "ensure_ascii=False"
+        )
+        print(
+            "[deterministic] regime_ledger hash_include="
+            f"{meta.get('included_fields')} hash_exclude={meta.get('excluded_fields')}"
+        )
+        print(
+            "[deterministic] regime_ledger history_sort=day asc "
+            f"history_len={meta.get('history_len')} regimes={meta.get('regime_keys')}"
+        )
+
+    canonical_json = _stable_json_dumps_canonical(canonical)
+    return det.sha256_text(canonical_json), meta
+
+
+def _hash_regime_ledger(path: str, debug: bool = False) -> Tuple[str, Dict[str, Any]]:
+    raw = det.load_json(path)
+    if raw is None:
+        return _hash_regime_ledger_dict(raw, debug=debug)
+    return _hash_regime_ledger_dict(raw, debug=debug)
+
+
+def _print_regime_ledger_diff_hint(expected: Dict[str, Any], current: Dict[str, Any]) -> None:
+    if not isinstance(expected, dict) or not isinstance(current, dict):
+        return
+    if expected.get("regime_ledger_hash") == current.get("regime_ledger_hash"):
+        return
+
+    exp_meta = expected.get("regime_ledger_meta")
+    cur_meta = current.get("regime_ledger_meta")
+
+    def _fmt_meta(meta: Any) -> str:
+        if not isinstance(meta, dict):
+            return "meta=n/a"
+        return (
+            "history_len="
+            f"{meta.get('history_len')} start_day={meta.get('start_day')} "
+            f"end_day={meta.get('end_day')} regimes={meta.get('regime_keys')}"
+        )
+
+    print(
+        "[deterministic] regime_ledger diff hint: "
+        f"expected({_fmt_meta(exp_meta)}) actual({_fmt_meta(cur_meta)})"
+    )
+
+
 def _build_deterministic_snapshot(
     base: Optional[Dict[str, Any]],
     payload: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+    include_timestamp: bool = False,
+) -> Optional[Dict[str, Any]] | Tuple[Optional[Dict[str, Any]], RegimeLedgerState]:
     if base is None:
         return None
     snapshot = dict(base)
     snapshot.update(payload)
-    snapshot["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if include_timestamp:
+        snapshot["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return snapshot
 
 
-def _run_deterministic_validation(
-    enabled: bool,
-    snapshot_path: str,
-    snapshot: Optional[Dict[str, Any]],
+def _compare_deterministic_snapshots(
+    first: Optional[Dict[str, Any]],
+    second: Optional[Dict[str, Any]],
 ) -> None:
-    if not enabled or snapshot is None:
-        return
+    if first is None or second is None:
+        raise RuntimeError("TASK-3M FAIL: deterministic snapshot missing")
 
-    print(f"[deterministic] input_hash={snapshot.get('input_hash')}")
-    print(f"[deterministic] equity_hash={snapshot.get('equity_hash')}")
-    print(f"[deterministic] total_pnl={snapshot.get('total_pnl')}")
+    print("[deterministic] compare run#1 vs run#2")
+    print(f"[deterministic] input_hash={first.get('input_hash')}")
+    print(f"[deterministic] equity_hash={first.get('equity_hash')}")
+    print(f"[deterministic] regime_ledger_hash={first.get('regime_ledger_hash')}")
+    print(f"[deterministic] total_pnl={first.get('total_pnl')}")
 
-    existing = det.load_json(snapshot_path)
-    if existing:
-        diffs = det.diff_snapshots(existing, snapshot, ignore_keys={"timestamp"})
-        if diffs:
-            for diff in diffs:
-                print(f"[deterministic] diff {diff}")
-            print("[deterministic] STATUS=FAIL")
-            raise RuntimeError("TASK-3M FAIL: deterministic violation")
-        print("[deterministic] STATUS=PASS")
-        return
-
-    det.save_json(snapshot_path, snapshot)
+    diffs = det.diff_snapshots(first, second, ignore_keys={"timestamp", "regime_ledger_meta"})
+    if diffs:
+        for diff in diffs:
+            print(f"[deterministic] diff {diff}")
+        _print_regime_ledger_diff_hint(first, second)
+        print("[deterministic] STATUS=FAIL")
+        raise RuntimeError("TASK-3M FAIL: deterministic violation")
     print("[deterministic] STATUS=PASS")
+
+
+def _build_deterministic_context(
+    args: argparse.Namespace,
+    execution_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    args_payload = vars(args).copy()
+    args_json = det.stable_json_dumps(args_payload)
+    args_hash = det.sha256_text(args_json)
+    seed = execution_settings.get("seed", 7) if isinstance(execution_settings, dict) else 7
+    input_hash = det.sha256_file(args.csv)
+    model_hash = det.sha256_file(args.model_path)
+    meta_state_hash = "skipped"
+    if int(args.meta_risk) == 1:
+        meta_state_hash = det.sha256_file(args.meta_state_path)
+    return {
+        "input_hash": input_hash,
+        "model_hash": model_hash,
+        "args_hash": args_hash,
+        "args_json": args_json,
+        "seed": int(seed),
+        "meta_state_hash": meta_state_hash,
+    }
+
+
+def _hash_equity_rows(rows: List[Dict[str, Any]]) -> str:
+    return det.hash_json(rows)
+
+
+def _hash_summary(summary: Dict[str, Any]) -> str:
+    return det.hash_json(summary)
+
+
+def _hash_regime_stats(regime_stats: Dict[str, Any]) -> str:
+    return det.hash_json(regime_stats)
 
 def _value_present(value: Any) -> bool:
     if value is None:
@@ -1720,6 +1910,8 @@ def update_regime_ledger(
     max_days: int,
     debug: bool = False,
     last_update_ts: Optional[str] = None,
+    read_only: bool = False,
+    return_state: bool = False,
 ) -> Optional[Dict[str, Any]]:
     ledger_path = os.path.join(out_dir, "regime_ledger.json")
     cfg = RegimeLedgerConfig(span=int(span), max_days=int(max_days))
@@ -1730,8 +1922,12 @@ def update_regime_ledger(
         debug=debug,
         last_update_ts=last_update_ts,
     )
-    state.save(ledger_path)
-    return state.compact_summary()
+    if not read_only:
+        state.save(ledger_path)
+    summary = state.compact_summary()
+    if return_state:
+        return summary, state
+    return summary
 
 
 def _build_fail_hard_message(
@@ -1949,7 +2145,7 @@ def _aggregate_trades_daily(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Lis
     return daily_rows, equity_rows, regime_stats, int(total_trades)
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default="data/live/XAUUSD_M1_live.csv")
     ap.add_argument("--model_path", default="data/ars_best_theta_regime_bank.npz")
@@ -1985,21 +2181,27 @@ def main() -> None:
     ap.add_argument("--mt5_format", default="json")
     ap.add_argument("--mt5_mode", default="trades")
     ap.add_argument("--deterministic_check", type=int, default=0)
+    return ap
 
-    args = ap.parse_args()
-    deterministic_enabled = _parse_bool_flag(args.deterministic_check, default=False)
 
-    mt5_export = _parse_bool_flag(args.mt5_export, default=False)
+def _run_live_sim_daily_once(
+    args: argparse.Namespace,
+    deterministic_enabled: bool,
+    write_outputs: bool,
+    read_only_state: bool,
+) -> Optional[Dict[str, Any]]:
+
+    mt5_export = _parse_bool_flag(args.mt5_export, default=False) and write_outputs
     mt5_format = str(args.mt5_format or "json").strip().lower()
     mt5_mode = str(args.mt5_mode or "trades").strip().lower()
     mt5_out_dir = args.mt5_out_dir if args.mt5_out_dir not in (None, "") else args.out_dir
 
-    ensure_dir(args.out_dir)
+    if write_outputs:
+        ensure_dir(args.out_dir)
     out_equity = os.path.join(args.out_dir, "live_daily_equity.csv")
     out_summary = os.path.join(args.out_dir, "live_daily_summary.json")
     out_regime = os.path.join(args.out_dir, "live_daily_regime.json")
     regime_ledger_path = os.path.join(args.out_dir, "regime_ledger.json")
-    deterministic_snapshot_path = os.path.join(args.out_dir, "deterministic_snapshot.json")
 
     debug_enabled = bool(int(args.debug)) if str(args.debug).strip() != "" else False
     debug_enabled = debug_enabled or (str(os.getenv("LIVE_SIM_DAILY_DEBUG", "")).strip() == "1")
@@ -2043,23 +2245,9 @@ def main() -> None:
 
     deterministic_ctx: Optional[Dict[str, Any]] = None
     if deterministic_enabled:
-        args_payload = vars(args).copy()
-        args_json = det.stable_json_dumps(args_payload)
-        args_hash = det.sha256_text(args_json)
-        seed = execution_settings.get("seed", 7) if isinstance(execution_settings, dict) else 7
-        input_hash = det.sha256_file(args.csv)
-        model_hash = det.sha256_file(args.model_path)
-        meta_state_hash = "skipped"
-        if int(args.meta_risk) == 1:
-            meta_state_hash = det.sha256_file(args.meta_state_path)
-        deterministic_ctx = {
-            "input_hash": input_hash,
-            "model_hash": model_hash,
-            "args_hash": args_hash,
-            "args_json": args_json,
-            "seed": int(seed),
-            "meta_state_hash": meta_state_hash,
-        }
+        deterministic_ctx = _build_deterministic_context(args, execution_settings)
+
+    deterministic_snapshot: Optional[Dict[str, Any]] = None
 
     if mode == "trades":
         daily_rows, equity_rows, regime_stats, total_trades = _aggregate_trades_daily(df)
@@ -2104,21 +2292,37 @@ def main() -> None:
             "daily_table": daily_rows,
         }
 
+        ledger_state = None
         if int(args.meta_risk) == 1:
-            ledger_summary = update_regime_ledger(
-                args.out_dir,
-                daily_rows,
-                regime_stats,
-                span=int(args.regime_ledger_span),
-                max_days=int(args.regime_ledger_max_days),
-                debug=debug_enabled,
-                last_update_ts=ledger_last_ts if deterministic_enabled else None,
-            )
+            if deterministic_enabled:
+                ledger_summary, ledger_state = update_regime_ledger(
+                    args.out_dir,
+                    daily_rows,
+                    regime_stats,
+                    span=int(args.regime_ledger_span),
+                    max_days=int(args.regime_ledger_max_days),
+                    debug=debug_enabled,
+                    last_update_ts=ledger_last_ts if deterministic_enabled else None,
+                    read_only=read_only_state,
+                    return_state=True,
+                )
+            else:
+                ledger_summary = update_regime_ledger(
+                    args.out_dir,
+                    daily_rows,
+                    regime_stats,
+                    span=int(args.regime_ledger_span),
+                    max_days=int(args.regime_ledger_max_days),
+                    debug=debug_enabled,
+                    last_update_ts=ledger_last_ts if deterministic_enabled else None,
+                    read_only=read_only_state,
+                )
             summary["regime_ledger"] = ledger_summary or {}
 
-        write_equity_csv(out_equity, equity_rows)
-        write_summary_json(out_summary, summary)
-        write_regime_json(out_regime, regime_stats)
+        if write_outputs:
+            write_equity_csv(out_equity, equity_rows)
+            write_summary_json(out_summary, summary)
+            write_regime_json(out_regime, regime_stats)
 
         if mt5_export:
             trades_export = df.copy()
@@ -2154,11 +2358,18 @@ def main() -> None:
             first_ts = ledger_first_ts
             last_ts = ledger_last_ts if ledger_last_ts else None
             regime_counts = _aggregate_regime_counts(regime_stats)
+            regime_ledger_hash = "skipped"
+            regime_ledger_meta = None
+            if ledger_state is not None:
+                regime_ledger_hash, regime_ledger_meta = _hash_regime_ledger_dict(
+                    ledger_state.to_dict(), debug=debug_enabled
+                )
             snapshot_payload = {
-                "equity_hash": det.sha256_file(out_equity),
-                "summary_hash": det.sha256_file(out_summary),
-                "regime_hash": det.sha256_file(out_regime),
-                "regime_ledger_hash": det.sha256_file(regime_ledger_path) if int(args.meta_risk) == 1 else "skipped",
+                "equity_hash": _hash_equity_rows(equity_rows),
+                "summary_hash": _hash_summary(summary),
+                "regime_hash": _hash_regime_stats(regime_stats),
+                "regime_ledger_hash": regime_ledger_hash,
+                "regime_ledger_meta": regime_ledger_meta,
                 "total_pnl": float(summary.get("total_pnl", 0.0)),
                 "total_trades": int(total_trades),
                 "days": int(len(daily_rows)),
@@ -2171,16 +2382,12 @@ def main() -> None:
                 "regime_counts": regime_counts,
                 "meta_scale_history_len": 0,
             }
-            snapshot = _build_deterministic_snapshot(deterministic_ctx, snapshot_payload)
-            _run_deterministic_validation(
-                deterministic_enabled,
-                deterministic_snapshot_path,
-                snapshot,
-            )
+            deterministic_snapshot = _build_deterministic_snapshot(deterministic_ctx, snapshot_payload)
 
-        print(f"Saved: {out_equity} {out_summary} {out_regime}")
-        print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
-        return
+        if write_outputs:
+            print(f"Saved: {out_equity} {out_summary} {out_regime}")
+            print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
+        return deterministic_snapshot
 
     # --- bars mode ---
     df, time_col = resolve_timestamp(df)
@@ -2249,6 +2456,8 @@ def main() -> None:
                 print(f"[meta_risk] loaded state from {args.meta_state_path}")
             except Exception as e:
                 print(f"[meta_risk] warn: cannot load state: {e}")
+        if read_only_state:
+            meta_state.read_only = True
 
     spread_open_cap = float(args.spread_open_cap)
     spread_spike_cap = float(args.spread_spike_cap)
@@ -2514,21 +2723,37 @@ def main() -> None:
         "daily_table": daily_rows,
     }
 
+    ledger_state = None
     if int(args.meta_risk) == 1:
-        ledger_summary = update_regime_ledger(
-            args.out_dir,
-            daily_rows,
-            regime_stats,
-            span=int(args.regime_ledger_span),
-            max_days=int(args.regime_ledger_max_days),
-            debug=debug_enabled,
-            last_update_ts=ledger_last_ts if deterministic_enabled else None,
-        )
+        if deterministic_enabled:
+            ledger_summary, ledger_state = update_regime_ledger(
+                args.out_dir,
+                daily_rows,
+                regime_stats,
+                span=int(args.regime_ledger_span),
+                max_days=int(args.regime_ledger_max_days),
+                debug=debug_enabled,
+                last_update_ts=ledger_last_ts if deterministic_enabled else None,
+                read_only=read_only_state,
+                return_state=True,
+            )
+        else:
+            ledger_summary = update_regime_ledger(
+                args.out_dir,
+                daily_rows,
+                regime_stats,
+                span=int(args.regime_ledger_span),
+                max_days=int(args.regime_ledger_max_days),
+                debug=debug_enabled,
+                last_update_ts=ledger_last_ts if deterministic_enabled else None,
+                read_only=read_only_state,
+            )
         summary["regime_ledger"] = ledger_summary or {}
 
-    write_equity_csv(out_equity, equity_rows)
-    write_summary_json(out_summary, summary)
-    write_regime_json(out_regime, regime_stats)
+    if write_outputs:
+        write_equity_csv(out_equity, equity_rows)
+        write_summary_json(out_summary, summary)
+        write_regime_json(out_regime, regime_stats)
 
     if mt5_export:
         trades_export_df = pd.DataFrame()
@@ -2564,11 +2789,18 @@ def main() -> None:
     if deterministic_enabled:
         first_ts = _format_ts(df["time"].iloc[0]) if len(df) > 0 else None
         last_ts = _format_ts(df["time"].iloc[-1]) if len(df) > 0 else None
+        regime_ledger_hash = "skipped"
+        regime_ledger_meta = None
+        if ledger_state is not None:
+            regime_ledger_hash, regime_ledger_meta = _hash_regime_ledger_dict(
+                ledger_state.to_dict(), debug=debug_enabled
+            )
         snapshot_payload = {
-            "equity_hash": det.sha256_file(out_equity),
-            "summary_hash": det.sha256_file(out_summary),
-            "regime_hash": det.sha256_file(out_regime),
-            "regime_ledger_hash": det.sha256_file(regime_ledger_path) if int(args.meta_risk) == 1 else "skipped",
+            "equity_hash": _hash_equity_rows(equity_rows),
+            "summary_hash": _hash_summary(summary),
+            "regime_hash": _hash_regime_stats(regime_stats),
+            "regime_ledger_hash": regime_ledger_hash,
+            "regime_ledger_meta": regime_ledger_meta,
             "total_pnl": float(summary.get("total_pnl", 0.0)),
             "total_trades": int(total_trades),
             "days": int(len(daily_rows)),
@@ -2581,15 +2813,40 @@ def main() -> None:
             "regime_counts": deterministic_regime_counts,
             "meta_scale_history_len": int(meta_scale_history_len),
         }
-        snapshot = _build_deterministic_snapshot(deterministic_ctx, snapshot_payload)
-        _run_deterministic_validation(
-            deterministic_enabled,
-            deterministic_snapshot_path,
-            snapshot,
-        )
+        deterministic_snapshot = _build_deterministic_snapshot(deterministic_ctx, snapshot_payload)
 
-    print(f"Saved: {out_equity} {out_summary} {out_regime}")
-    print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
+    if write_outputs:
+        print(f"Saved: {out_equity} {out_summary} {out_regime}")
+        print(f"Days: {len(daily_rows)} Total PnL: {summary['total_pnl']}")
+    return deterministic_snapshot
+
+
+def main() -> None:
+    ap = _build_arg_parser()
+    args = ap.parse_args()
+    deterministic_enabled = _parse_bool_flag(args.deterministic_check, default=False)
+    if deterministic_enabled:
+        snapshot1 = _run_live_sim_daily_once(
+            args,
+            deterministic_enabled=True,
+            write_outputs=False,
+            read_only_state=True,
+        )
+        snapshot2 = _run_live_sim_daily_once(
+            args,
+            deterministic_enabled=True,
+            write_outputs=False,
+            read_only_state=True,
+        )
+        _compare_deterministic_snapshots(snapshot1, snapshot2)
+        return
+
+    _run_live_sim_daily_once(
+        args,
+        deterministic_enabled=False,
+        write_outputs=True,
+        read_only_state=False,
+    )
 
 
 # How to test:

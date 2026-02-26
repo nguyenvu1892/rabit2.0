@@ -302,6 +302,7 @@ def _date_ordinal(value: Optional[str]) -> Optional[int]:
 class MetaRiskState:
     def __init__(self, cfg: MetaRiskConfig) -> None:
         self.cfg = cfg
+        self.read_only = False
         self.regimes: Dict[str, RegimeStats] = {}
         self.stats = self.regimes
         self.daily_equity_peak = 0.0
@@ -694,7 +695,7 @@ class MetaRiskState:
                     except Exception:
                         dt = None
                 if dt is None:
-                    dt = datetime.datetime.utcnow().date()
+                    dt = datetime.datetime.now(getattr(datetime, "UTC", datetime.timezone.utc)).date()
                 freeze_until = dt + datetime.timedelta(days=self.cfg.freeze_days)
                 self.regime_freeze_until[regime_key] = freeze_until.isoformat()
 
@@ -990,6 +991,8 @@ class MetaRiskState:
         return cls.from_dict(None, data)
 
     def save(self, path: str) -> None:
+        if getattr(self, "read_only", False):
+            return
         data = self.to_dict()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
@@ -1012,6 +1015,8 @@ class MetaRiskState:
 
 def save_json(path: str, state: MetaRiskState) -> bool:
     if not path or state is None:
+        return False
+    if getattr(state, "read_only", False):
         return False
 
     try:
