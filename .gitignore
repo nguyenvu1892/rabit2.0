@@ -24,3 +24,5 @@ data/*.npz
 data/*.json
 data/reports/
 *.log
+data/snapshots/
+data/reports/
