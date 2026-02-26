@@ -18,11 +18,11 @@ env/
 Thumbs.db
 .vscode/
 
-# Data / outputs (tuỳ bạn muốn giữ hay không)
+# Data / outputs (generated artifacts)
 data/*.npy
 data/*.npz
-data/*.json
-data/reports/
+data/reports/**/*.csv
+data/reports/**/*.json
+data/reports/**/*.jsonl
+data/snapshots/**
 *.log
-data/snapshots/
-data/reports/
