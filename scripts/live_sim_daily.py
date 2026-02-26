@@ -12,13 +12,15 @@ import os
 import re
 import json
 import argparse
-import datetime
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 
-from scripts import deterministic_utils as det
+from scripts import _deterministic as detx
+from scripts import _io_utils as io_utils
+from rabit.meta import regime_ledger as regime_ledger_meta
+from rabit.risk import risk_cap as risk_cap
 from rabit.data.feature_builder import FeatureBuilder, FeatureConfig
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
@@ -113,7 +115,7 @@ _MT5_DECISION_COLUMNS = [
 # ----------------------------
 
 def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    return io_utils.ensure_dir(path)
 
 
 def _debug_print(enabled: bool, msg: str) -> None:
@@ -165,40 +167,15 @@ def _debug_perf_update(
 
 
 def _read_sample_line(path: str, max_chars: int = 200) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.strip():
-                    return line.strip()[:max_chars]
-    except Exception:
-        return ""
-    return ""
+    return io_utils._read_sample_line(path, max_chars=max_chars)
 
 
 def _normalize_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    df = df.copy()
-    mapping: Dict[str, str] = {}
-    new_cols: List[str] = []
-    for c in df.columns:
-        orig = str(c)
-        s = orig.strip()
-        if s.startswith("<") and s.endswith(">"):
-            s = s[1:-1].strip()
-        s = s.lower()
-        mapping[orig] = s
-        new_cols.append(s)
-    df.columns = new_cols
-    return df, mapping
+    return io_utils._normalize_columns(df)
 
 
 def _alias_column(df: pd.DataFrame, target: str, aliases: List[str]) -> pd.DataFrame:
-    if target in df.columns:
-        return df
-    for c in aliases:
-        if c in df.columns:
-            df[target] = df[c]
-            return df
-    return df
+    return io_utils._alias_column(df, target, aliases)
 
 
 def _ensure_mt5_bars_columns(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
@@ -208,64 +185,18 @@ def _ensure_mt5_bars_columns(df: pd.DataFrame, debug: bool = False) -> pd.DataFr
       - tickvol from tickvol/tick_vol/tick vol/vol/volume
       - spread default 0 if missing
     """
-    out = df.copy()
-
-    out = _alias_column(
-        out,
-        "tickvol",
-        ["tickvol", "tick_vol", "tick vol", "tickvolume", "tick volume", "ticks"],
-    )
-    if "tickvol" not in out.columns:
-        out = _alias_column(out, "tickvol", ["vol", "volume", "real_volume", "real volume"])
-        if debug and "tickvol" in out.columns:
-            _debug_print(debug, "[debug] tickvol missing -> using vol/volume as tickvol")
-
-    if "tickvol" not in out.columns:
-        out["tickvol"] = 0
-
-    if "spread" not in out.columns:
-        out["spread"] = 0
-
-    required = ["open", "high", "low", "close"]
-    missing = [c for c in required if c not in out.columns]
-    if missing:
-        raise ValueError(f"Missing required OHLC columns: {missing}. detected_cols={list(out.columns)}")
-
-    for c in required:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    out["tickvol"] = pd.to_numeric(out["tickvol"], errors="coerce").fillna(0).astype("int64")
-    out["spread"] = pd.to_numeric(out["spread"], errors="coerce").fillna(0).astype("int64")
-    return out
+    return io_utils._ensure_mt5_bars_columns(df, debug=debug)
 
 
 def _prepare_bars_df(df: pd.DataFrame, time_col: str, debug: bool = False) -> pd.DataFrame:
-    out = _ensure_mt5_bars_columns(df, debug=debug)
-    out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
-    out = out.dropna(subset=[time_col])
-    out = out.dropna(subset=["open", "high", "low", "close"])
-    out = out.sort_values(time_col)
-    out = out.drop_duplicates(subset=[time_col], keep="last").reset_index(drop=True)
-    out = out.set_index(time_col, drop=False)
-    return out
+    return io_utils._prepare_bars_df(df, time_col=time_col, debug=debug)
 
 
 def read_csv_mt5_first(path: str, sample_line: str, debug: bool = False) -> Tuple[pd.DataFrame, str]:
     """
     Legacy CSV reader (kept for backward compatibility).
     """
-    detected_sep = ","
-    df = pd.read_csv(path)
-    if len(df.columns) == 1:
-        only = str(df.columns[0])
-        if "\t" in only or "\t" in sample_line:
-            df = pd.read_csv(path, sep="\t")
-            detected_sep = "\t"
-        elif ";" in only or ";" in sample_line:
-            df = pd.read_csv(path, sep=";")
-            detected_sep = ";"
-    _debug_print(debug, f"[debug] legacy detected_sep={repr(detected_sep)}")
-    return df, detected_sep
+    return io_utils.read_csv_mt5_first(path, sample_line=sample_line, debug=debug)
 
 
 def read_csv_smart(path: str, debug: bool = False) -> Tuple[pd.DataFrame, str]:
@@ -275,31 +206,11 @@ def read_csv_smart(path: str, debug: bool = False) -> Tuple[pd.DataFrame, str]:
       - if 1 col and header contains '\\t' -> re-read with sep='\\t'
       - else if header contains ';' -> re-read with sep=';'
     """
-    detected_sep = ","
-    df = pd.read_csv(path)
-    if len(df.columns) == 1:
-        header = str(df.columns[0])
-        if "\t" in header:
-            df = pd.read_csv(path, sep="\t")
-            detected_sep = "\t"
-        elif ";" in header:
-            df = pd.read_csv(path, sep=";")
-            detected_sep = ";"
-
-    # Legacy fallback: sample-line sniff if still 1 column
-    if len(df.columns) == 1 and detected_sep == ",":
-        sample_line = _read_sample_line(path)
-        if "\t" in sample_line or ";" in sample_line:
-            df, detected_sep = read_csv_mt5_first(path, sample_line=sample_line, debug=debug)
-
-    _debug_print(debug, f"[debug] detected_sep={repr(detected_sep)}")
-    return df, detected_sep
+    return io_utils.read_csv_smart(path, debug=debug)
 
 
 def _col_present(cols: set[str], name: str) -> bool:
-    if name in cols:
-        return True
-    return name.replace("_", " ") in cols
+    return io_utils._col_present(cols, name)
 
 
 def resolve_timestamp(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
@@ -311,51 +222,14 @@ def resolve_timestamp(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
       - else if time -> parse time
     Drops NaT rows and sorts by timestamp.
     """
-    if df is None or len(df) == 0:
-        return df, None
-
-    out = df.copy()
-    cols = set(out.columns)
-    time_col: Optional[str] = None
-
-    for c in ["timestamp", "datetime", "ts"]:
-        if c in cols:
-            time_col = c
-            break
-
-    if time_col is None and "date" in cols and "time" in cols:
-        out["timestamp"] = pd.to_datetime(
-            out["date"].astype(str).str.strip() + " " + out["time"].astype(str).str.strip(),
-            errors="coerce",
-        )
-        time_col = "timestamp"
-    elif time_col is None and "date" in cols:
-        out["timestamp"] = pd.to_datetime(out["date"].astype(str).str.strip(), errors="coerce")
-        time_col = "timestamp"
-    elif time_col is None and "time" in cols:
-        time_col = "time"
-
-    if time_col is None:
-        return out, None
-
-    out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
-    out = out.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
-    return out, time_col
+    return io_utils.resolve_timestamp(df)
 
 
 def detect_input_mode(df: pd.DataFrame) -> str:
     """
     Detect bars vs trades CSV based on normalized columns.
     """
-    cols = set(df.columns)
-    is_bars = all(_col_present(cols, c) for c in ["open", "high", "low", "close"])
-    is_trades = all(_col_present(cols, c) for c in ["entry_time", "exit_time", "entry_price", "exit_price"])
-
-    if is_bars and not is_trades:
-        return "bars"
-    if is_trades and not is_bars:
-        return "trades"
-    raise ValueError(f"Ambiguous or unknown CSV columns. detected_cols={','.join(sorted(cols))}")
+    return io_utils.detect_input_mode(df)
 
 
 # ----------------------------
@@ -569,40 +443,18 @@ def _risk_cap_position_size(
     Apply a hard risk cap to the model size.
     Size is interpreted in the same volume units used by the ledger (lot-equivalent).
     """
-    model_size = max(0.0, _safe_float(model_size, 0.0))
-    sl_mult = max(0.0, _safe_float(sl_mult, 0.0))
-    atr = max(0.0, _safe_float(atr, 0.0))
-    equity_at_entry = max(0.0, _safe_float(equity_at_entry, 0.0))
-    risk_per_trade = max(0.0, _safe_float(risk_per_trade, 0.0))
-    sl_min_price = max(0.0, _safe_float(sl_min_price, 0.0))
-    contract_value_per_1_0_move = max(0.0, _safe_float(contract_value_per_1_0_move, 0.0))
-    min_lot = max(0.0, _safe_float(min_lot, 0.0))
-    max_lot = max(min_lot, _safe_float(max_lot, 0.0))
-
-    risk_budget = float(risk_per_trade * equity_at_entry)
-    sl_distance_price = float(max(sl_mult * atr, sl_min_price))
-    usd_loss_per_1lot = float(sl_distance_price * contract_value_per_1_0_move)
-    cap_lots = float(risk_budget / max(usd_loss_per_1lot, eps)) if risk_budget > 0.0 else 0.0
-
-    if model_size <= 0.0 or cap_lots <= 0.0 or risk_budget <= 0.0:
-        final_size = 0.0
-    else:
-        capped = min(model_size, cap_lots)
-        # Preserve risk cap when cap_lots < min_lot (do not lift above cap).
-        if cap_lots < min_lot:
-            final_size = float(max(0.0, capped))
-        else:
-            final_size = float(np.clip(capped, min_lot, max_lot))
-
-    debug = {
-        "risk_budget_usd": float(risk_budget),
-        "sl_distance_price": float(sl_distance_price),
-        "usd_loss_per_1lot_if_sl": float(usd_loss_per_1lot),
-        "cap_lots": float(cap_lots),
-        "model_size": float(model_size),
-        "final_size": float(final_size),
-    }
-    return float(final_size), debug
+    return risk_cap.risk_cap_position_size(
+        model_size=model_size,
+        sl_mult=sl_mult,
+        atr=atr,
+        equity_at_entry=equity_at_entry,
+        risk_per_trade=risk_per_trade,
+        sl_min_price=sl_min_price,
+        contract_value_per_1_0_move=contract_value_per_1_0_move,
+        min_lot=min_lot,
+        max_lot=max_lot,
+        eps=eps,
+    )
 
 
 def _compute_pnl_from_trades_df(trades_df: pd.DataFrame) -> float:
@@ -1395,161 +1247,27 @@ def _meta_scale_history_len(decisions: Optional[List[Dict[str, Any]]]) -> int:
     return int(total)
 
 
-_DET_REGIME_LEDGER_EXCLUDE = {"last_update_ts"}
+_DET_REGIME_LEDGER_EXCLUDE = regime_ledger_meta.DET_REGIME_LEDGER_EXCLUDE
 
 
 def _stable_json_dumps_canonical(data: Any) -> str:
-    return json.dumps(
-        data,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
-    )
+    return regime_ledger_meta.stable_json_dumps(data)
 
 
 def _canonicalize_regime_ledger(raw: Any) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    # Deterministic hashing excludes fields that vary per run (e.g. last_update_ts).
-    meta: Dict[str, Any] = {
-        "included_fields": ["config", "start_day", "end_day", "history", "regimes"],
-        "excluded_fields": sorted(_DET_REGIME_LEDGER_EXCLUDE),
-    }
-    if not isinstance(raw, dict):
-        meta["status"] = "missing_or_invalid"
-        return None, meta
-
-    config_raw = raw.get("config", {})
-    config_out: Dict[str, Any] = {}
-    if isinstance(config_raw, dict):
-        span = _safe_int_or_none(config_raw.get("span"))
-        max_days = _safe_int_or_none(config_raw.get("max_days"))
-        alpha = _safe_float(config_raw.get("alpha", 0.0), 0.0)
-        config_out = {
-            "span": int(span) if span is not None else 0,
-            "max_days": int(max_days) if max_days is not None else 0,
-            "alpha": float(alpha),
-        }
-
-    history_raw = raw.get("history", [])
-    history_out: List[Dict[str, Any]] = []
-    if isinstance(history_raw, list):
-        for rec in history_raw:
-            if not isinstance(rec, dict):
-                continue
-            day = _safe_optional_str(rec.get("day"))
-            if not day:
-                continue
-            history_out.append(
-                {
-                    "day": day,
-                    "regime": _safe_str(rec.get("regime"), default="unknown"),
-                    "day_pnl": _safe_float(rec.get("day_pnl", 0.0), 0.0),
-                    "start_equity": _safe_float(rec.get("start_equity", 0.0), 0.0),
-                    "end_equity": _safe_float(rec.get("end_equity", 0.0), 0.0),
-                    "intraday_dd": _safe_float(rec.get("intraday_dd", 0.0), 0.0),
-                    "end_loss_streak": int(_safe_int_or_none(rec.get("end_loss_streak", 0)) or 0),
-                }
-            )
-    history_out.sort(key=lambda r: str(r.get("day", "")))
-
-    regimes_out: Dict[str, Dict[str, Any]] = {}
-    regimes_raw = raw.get("regimes", {})
-    if isinstance(regimes_raw, dict):
-        for regime_key, stats in regimes_raw.items():
-            if not isinstance(stats, dict):
-                continue
-            regimes_out[str(regime_key)] = {
-                "winrate_ewm": _safe_float(stats.get("winrate_ewm", 0.0), 0.0),
-                "avg_pnl_ewm": _safe_float(stats.get("avg_pnl_ewm", 0.0), 0.0),
-                "loss_streak_ewm": _safe_float(stats.get("loss_streak_ewm", 0.0), 0.0),
-                "n_days": int(_safe_int_or_none(stats.get("n_days", 0)) or 0),
-                "last_day": _safe_optional_str(stats.get("last_day")),
-            }
-
-    start_day = _safe_optional_str(raw.get("start_day"))
-    end_day = _safe_optional_str(raw.get("end_day"))
-    if start_day is None and history_out:
-        start_day = history_out[0].get("day")
-    if end_day is None and history_out:
-        end_day = history_out[-1].get("day")
-
-    meta.update(
-        {
-            "history_len": int(len(history_out)),
-            "regime_keys": sorted(regimes_out.keys()),
-            "start_day": start_day,
-            "end_day": end_day,
-        }
-    )
-
-    canonical = {
-        "config": config_out,
-        "start_day": start_day,
-        "end_day": end_day,
-        "history": history_out,
-        "regimes": regimes_out,
-    }
-    return canonical, meta
+    return regime_ledger_meta.canonicalize_regime_ledger(raw, exclude_fields=_DET_REGIME_LEDGER_EXCLUDE)
 
 
 def _hash_regime_ledger_dict(raw: Any, debug: bool = False) -> Tuple[str, Dict[str, Any]]:
-    canonical, meta = _canonicalize_regime_ledger(raw)
-    if canonical is None:
-        status = "missing"
-        if isinstance(raw, dict):
-            status = "invalid"
-        meta["status"] = status
-        if debug:
-            print(f"[deterministic] regime_ledger hash skipped: status={status}")
-        return status, meta
-
-    if debug:
-        print(
-            "[deterministic] regime_ledger canonicalize: sort_keys=True separators=(',', ':') "
-            "ensure_ascii=False"
-        )
-        print(
-            "[deterministic] regime_ledger hash_include="
-            f"{meta.get('included_fields')} hash_exclude={meta.get('excluded_fields')}"
-        )
-        print(
-            "[deterministic] regime_ledger history_sort=day asc "
-            f"history_len={meta.get('history_len')} regimes={meta.get('regime_keys')}"
-        )
-
-    canonical_json = _stable_json_dumps_canonical(canonical)
-    return det.sha256_text(canonical_json), meta
+    return detx.hash_regime_ledger_dict(raw, debug=debug)
 
 
 def _hash_regime_ledger(path: str, debug: bool = False) -> Tuple[str, Dict[str, Any]]:
-    raw = det.load_json(path)
-    if raw is None:
-        return _hash_regime_ledger_dict(raw, debug=debug)
-    return _hash_regime_ledger_dict(raw, debug=debug)
+    return detx.hash_regime_ledger_file(path, debug=debug)
 
 
 def _print_regime_ledger_diff_hint(expected: Dict[str, Any], current: Dict[str, Any]) -> None:
-    if not isinstance(expected, dict) or not isinstance(current, dict):
-        return
-    if expected.get("regime_ledger_hash") == current.get("regime_ledger_hash"):
-        return
-
-    exp_meta = expected.get("regime_ledger_meta")
-    cur_meta = current.get("regime_ledger_meta")
-
-    def _fmt_meta(meta: Any) -> str:
-        if not isinstance(meta, dict):
-            return "meta=n/a"
-        return (
-            "history_len="
-            f"{meta.get('history_len')} start_day={meta.get('start_day')} "
-            f"end_day={meta.get('end_day')} regimes={meta.get('regime_keys')}"
-        )
-
-    print(
-        "[deterministic] regime_ledger diff hint: "
-        f"expected({_fmt_meta(exp_meta)}) actual({_fmt_meta(cur_meta)})"
-    )
+    detx.print_regime_ledger_diff_hint(expected, current)
 
 
 def _build_deterministic_snapshot(
@@ -1557,71 +1275,34 @@ def _build_deterministic_snapshot(
     payload: Dict[str, Any],
     include_timestamp: bool = False,
 ) -> Optional[Dict[str, Any]] | Tuple[Optional[Dict[str, Any]], RegimeLedgerState]:
-    if base is None:
-        return None
-    snapshot = dict(base)
-    snapshot.update(payload)
-    if include_timestamp:
-        snapshot["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    return snapshot
+    return detx.build_deterministic_snapshot(base, payload, include_timestamp=include_timestamp)
 
 
 def _compare_deterministic_snapshots(
     first: Optional[Dict[str, Any]],
     second: Optional[Dict[str, Any]],
 ) -> None:
-    if first is None or second is None:
-        raise RuntimeError("TASK-3M FAIL: deterministic snapshot missing")
-
-    print("[deterministic] compare run#1 vs run#2")
-    print(f"[deterministic] input_hash={first.get('input_hash')}")
-    print(f"[deterministic] equity_hash={first.get('equity_hash')}")
-    print(f"[deterministic] regime_ledger_hash={first.get('regime_ledger_hash')}")
-    print(f"[deterministic] total_pnl={first.get('total_pnl')}")
-
-    diffs = det.diff_snapshots(first, second, ignore_keys={"timestamp", "regime_ledger_meta"})
-    if diffs:
-        for diff in diffs:
-            print(f"[deterministic] diff {diff}")
-        _print_regime_ledger_diff_hint(first, second)
-        print("[deterministic] STATUS=FAIL")
-        raise RuntimeError("TASK-3M FAIL: deterministic violation")
-    print("[deterministic] STATUS=PASS")
+    detx.compare_deterministic_snapshots(first, second)
 
 
 def _build_deterministic_context(
     args: argparse.Namespace,
     execution_settings: Dict[str, Any],
 ) -> Dict[str, Any]:
-    args_payload = vars(args).copy()
-    args_json = det.stable_json_dumps(args_payload)
-    args_hash = det.sha256_text(args_json)
-    seed = execution_settings.get("seed", 7) if isinstance(execution_settings, dict) else 7
-    input_hash = det.sha256_file(args.csv)
-    model_hash = det.sha256_file(args.model_path)
-    meta_state_hash = "skipped"
-    if int(args.meta_risk) == 1:
-        meta_state_hash = det.sha256_file(args.meta_state_path)
-    return {
-        "input_hash": input_hash,
-        "model_hash": model_hash,
-        "args_hash": args_hash,
-        "args_json": args_json,
-        "seed": int(seed),
-        "meta_state_hash": meta_state_hash,
-    }
+    return detx.build_deterministic_context(args, execution_settings)
 
 
 def _hash_equity_rows(rows: List[Dict[str, Any]]) -> str:
-    return det.hash_json(rows)
+    return detx.hash_equity_rows(rows)
 
 
 def _hash_summary(summary: Dict[str, Any]) -> str:
-    return det.hash_json(summary)
+    return detx.hash_summary(summary)
 
 
 def _hash_regime_stats(regime_stats: Dict[str, Any]) -> str:
-    return det.hash_json(regime_stats)
+    return detx.hash_regime_stats(regime_stats)
+
 
 def _value_present(value: Any) -> bool:
     if value is None:
@@ -2344,6 +2025,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--spread_open_cap", type=float, default=200.0)
     ap.add_argument("--atr_period", type=int, default=14)
     ap.add_argument("--debug", type=int, default=0)
+    ap.add_argument("--guardrail_stress", type=int, default=0)
     ap.add_argument("--enable_london", type=int, default=1)
     ap.add_argument("--enable_ny", type=int, default=1)
     ap.add_argument("--london_start", type=int, default=None)
@@ -2382,6 +2064,9 @@ def _run_live_sim_daily_once(
 
     debug_enabled = bool(int(args.debug)) if str(args.debug).strip() != "" else False
     debug_enabled = debug_enabled or (str(os.getenv("LIVE_SIM_DAILY_DEBUG", "")).strip() == "1")
+    guardrail_stress = _parse_bool_flag(args.guardrail_stress, default=False)
+    if guardrail_stress and debug_enabled:
+        print("[stress] guardrail_stress=1 (no-op)")
 
     meta_risk_enabled = int(args.meta_risk) == 1
     meta_feedback_enabled = int(args.meta_feedback) == 1
@@ -2647,7 +2332,7 @@ def _run_live_sim_daily_once(
             regime_ledger_meta = None
             if ledger_state is not None:
                 regime_ledger_hash, regime_ledger_meta = _hash_regime_ledger_dict(
-                    ledger_state.to_dict(), debug=debug_enabled
+                    ledger_state.to_dict(), debug=bool(debug_enabled or deterministic_enabled)
                 )
             snapshot_payload = {
                 "equity_hash": _hash_equity_rows(equity_rows),
@@ -3132,7 +2817,7 @@ def _run_live_sim_daily_once(
         regime_ledger_meta = None
         if ledger_state is not None:
             regime_ledger_hash, regime_ledger_meta = _hash_regime_ledger_dict(
-                ledger_state.to_dict(), debug=debug_enabled
+                ledger_state.to_dict(), debug=bool(debug_enabled or deterministic_enabled)
             )
         snapshot_payload = {
             "equity_hash": _hash_equity_rows(equity_rows),

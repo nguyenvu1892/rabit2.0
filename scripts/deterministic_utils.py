@@ -15,7 +15,7 @@ def stable_json_dumps(data: Any) -> str:
         data,
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=True,
+        ensure_ascii=False,
         default=_json_default,
     )
 
@@ -55,7 +55,7 @@ def load_json(path: str) -> Optional[Dict[str, Any]]:
 
 def save_json(path: str, data: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=True, indent=2, sort_keys=True)
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 def _strip_keys(data: Any, ignore_keys: Optional[Set[str]]) -> Any:
