@@ -162,33 +162,6 @@ def main() -> None:
 
     _guard_trades_df(df, args.trades)
 
-    regime_col = args.regime_col.strip() or _resolve_column(
-        df,
-        "regime",
-        ["regime", "regime_label", "regime_name", "market_regime"],
-        required=False,
-        default=None,
-    )
-
-    return_col = args.return_col.strip()
-    if not return_col:
-        return_col = _resolve_column(
-            df,
-            "return",
-            ["pnl", "net_pnl", "profit", "pnl_usd", "pnl_points", "ret", "return"],
-            required=True,
-        )
-    if return_col not in df.columns:
-        raise ValueError(f"return_col='{return_col}' not found. columns={list(df.columns)}")
-
-    ts_col = args.ts_col.strip() or _resolve_column(
-        df,
-        "timestamp",
-        ["exit_time", "exit_ts", "close_ts", "ts", "timestamp", "time"],
-        required=False,
-        default=None,
-    )
-
     cfg_kwargs: Dict[str, Any] = {
         "min_trades_per_regime": int(args.min_trades_per_regime),
         "ewma_alpha": float(args.ewma_alpha),
@@ -219,6 +192,62 @@ def main() -> None:
         cfg_kwargs["dd_soft_limit"] = float(args.dd_soft_limit)
     cfg = MetaRiskConfig(**cfg_kwargs)
     state = MetaRiskState(cfg)
+
+    if df.shape[0] == 0:
+        out_state = os.path.join(args.out_dir, "meta_risk_state.json")
+        state.save(out_state)
+        summary = {
+            "source_trades": args.trades,
+            "rows": int(len(df)),
+            "config": asdict(cfg),
+            "resolved_columns": {
+                "regime_col": args.regime_col.strip() or None,
+                "return_col": args.return_col.strip() or None,
+                "ts_col": args.ts_col.strip() or None,
+            },
+            "per_regime": [],
+            "global": {
+                "regimes": 0,
+                "total_trades": 0,
+                "global_scale": float(state.global_scale()),
+                "global_state": str(state.global_state),
+                "global_metrics": state.global_metrics_snapshot(),
+            },
+        }
+        out_summary = os.path.join(args.out_dir, "meta_risk_summary.json")
+        with open(out_summary, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print("[meta_risk_build] rows=0 regimes=0 total_trades=0 (empty trades input)")
+        print(f"[meta_risk_build] saved: {out_state}")
+        print(f"[meta_risk_build] saved: {out_summary}")
+        return
+
+    regime_col = args.regime_col.strip() or _resolve_column(
+        df,
+        "regime",
+        ["regime", "regime_label", "regime_name", "market_regime"],
+        required=False,
+        default=None,
+    )
+
+    return_col = args.return_col.strip()
+    if not return_col:
+        return_col = _resolve_column(
+            df,
+            "return",
+            ["pnl", "net_pnl", "profit", "pnl_usd", "pnl_points", "ret", "return"],
+            required=True,
+        )
+    if return_col not in df.columns:
+        raise ValueError(f"return_col='{return_col}' not found. columns={list(df.columns)}")
+
+    ts_col = args.ts_col.strip() or _resolve_column(
+        df,
+        "timestamp",
+        ["exit_time", "exit_ts", "close_ts", "ts", "timestamp", "time"],
+        required=False,
+        default=None,
+    )
 
     regimes = (
         df[regime_col].astype(str).fillna("unknown")
@@ -281,7 +310,13 @@ def main() -> None:
             "ts_col": ts_col,
         },
         "per_regime": per_regime,
-        "global": {"regimes": int(len(per_regime)), "total_trades": int(total_trades)},
+        "global": {
+            "regimes": int(len(per_regime)),
+            "total_trades": int(total_trades),
+            "global_scale": float(state.global_scale()),
+            "global_state": str(state.global_state),
+            "global_metrics": state.global_metrics_snapshot(),
+        },
     }
 
     out_summary = os.path.join(args.out_dir, "meta_risk_summary.json")
