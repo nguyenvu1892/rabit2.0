@@ -182,7 +182,9 @@ class RegimeLedgerState:
         if last_update_ts is not None:
             self.last_update_ts = str(last_update_ts)
         else:
-            self.last_update_ts = datetime.datetime.utcnow().isoformat()
+            self.last_update_ts = datetime.datetime.now(
+                getattr(datetime, "UTC", datetime.timezone.utc)
+            ).isoformat()
         if debug:
             print(f"[regime_ledger] updated history={len(self.history)} max_days={max_days}")
 
