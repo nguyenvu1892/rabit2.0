@@ -19,6 +19,7 @@ import pandas as pd
 from rabit.data.feature_builder import FeatureBuilder, FeatureConfig
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
+from rabit.rl.regime_ledger import RegimeLedgerConfig, RegimeLedgerState
 from rabit.env.trading_env import TradingEnv
 from rabit.env.session_filter import SessionFilter, SessionConfig
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -1076,6 +1077,22 @@ def write_regime_json(path: str, regime_stats: Dict[str, Any]) -> None:
         json.dump(regime_stats, f, ensure_ascii=False, indent=2)
 
 
+def update_regime_ledger(
+    out_dir: str,
+    daily_rows: List[Dict[str, Any]],
+    regime_stats: Dict[str, Any],
+    span: int,
+    max_days: int,
+    debug: bool = False,
+) -> Optional[Dict[str, Any]]:
+    ledger_path = os.path.join(out_dir, "regime_ledger.json")
+    cfg = RegimeLedgerConfig(span=int(span), max_days=int(max_days))
+    state = RegimeLedgerState.load(ledger_path, cfg=cfg)
+    state.update_from_daily_outputs(daily_rows, regime_stats, debug=debug)
+    state.save(ledger_path)
+    return state.compact_summary()
+
+
 def _build_fail_hard_message(
     input_csv: str,
     model_path: str,
@@ -1304,6 +1321,8 @@ def main() -> None:
     ap.add_argument("--meta_risk", type=int, default=0)
     ap.add_argument("--meta_feedback", type=int, default=0)
     ap.add_argument("--meta_state_path", default="data/reports/meta_risk_state.json")
+    ap.add_argument("--regime_ledger_span", type=int, default=30)
+    ap.add_argument("--regime_ledger_max_days", type=int, default=365)
 
     ap.add_argument("--daily_dd_limit", type=float, default=200.0)
     ap.add_argument("--max_loss_streak", type=int, default=4)
@@ -1387,6 +1406,17 @@ def main() -> None:
             "worst_day": worst_day or {},
             "daily_table": daily_rows,
         }
+
+        if int(args.meta_risk) == 1:
+            ledger_summary = update_regime_ledger(
+                args.out_dir,
+                daily_rows,
+                regime_stats,
+                span=int(args.regime_ledger_span),
+                max_days=int(args.regime_ledger_max_days),
+                debug=debug_enabled,
+            )
+            summary["regime_ledger"] = ledger_summary or {}
 
         write_equity_csv(out_equity, equity_rows)
         write_summary_json(out_summary, summary)
@@ -1665,6 +1695,17 @@ def main() -> None:
         "worst_day": worst_day or {},
         "daily_table": daily_rows,
     }
+
+    if int(args.meta_risk) == 1:
+        ledger_summary = update_regime_ledger(
+            args.out_dir,
+            daily_rows,
+            regime_stats,
+            span=int(args.regime_ledger_span),
+            max_days=int(args.regime_ledger_max_days),
+            debug=debug_enabled,
+        )
+        summary["regime_ledger"] = ledger_summary or {}
 
     write_equity_csv(out_equity, equity_rows)
     write_summary_json(out_summary, summary)
