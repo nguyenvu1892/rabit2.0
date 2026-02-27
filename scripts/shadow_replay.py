@@ -12,6 +12,7 @@ from scripts import _io_utils as io_utils
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 from rabit.rl.regime_perf_feedback import RegimePerfConfig, RegimePerfFeedbackEngine
+from rabit.meta import perf_history
 from rabit.state import versioned_state as vstate
 
 
@@ -455,6 +456,20 @@ def _run_shadow_replay_once(
         "daily_table": daily_rows,
     }
 
+    perf_summary = perf_history.compute_summary_from_daily_rows(daily_rows, total_trades=total_trades)
+    perf_daily: List[Dict[str, Any]] = []
+    for row in daily_rows:
+        if not isinstance(row, dict):
+            continue
+        perf_daily.append(
+            {
+                "day": row.get("day"),
+                "day_pnl": row.get("day_pnl"),
+                "intraday_dd": row.get("intraday_dd"),
+                "end_loss_streak": row.get("end_loss_streak"),
+            }
+        )
+
     ledger_state = None
     regime_ledger_hash = "skipped"
     regime_ledger_meta = None
@@ -512,6 +527,8 @@ def _run_shadow_replay_once(
             "short": int(decisions_counts.get("short", 0)),
             "trades_simulated": int(total_trades),
         },
+        "perf_summary": perf_summary,
+        "perf_daily": perf_daily,
         "status": "PASS",
         "reasons": [],
     }
@@ -614,6 +631,21 @@ def main() -> None:
         report["reasons"] = []
 
     _write_report(cli_args.out_json, report)
+
+    if report.get("status") == "PASS":
+        perf_payload = perf_history.build_perf_history_from_report(
+            report=report,
+            meta_state_path=cli_args.meta_state_path,
+            source_csv=report.get("input_csv") or cli_args.csv,
+        )
+        if perf_payload is not None:
+            perf_path = perf_history.perf_history_path(cli_args.meta_state_path)
+            perf_history.write_perf_history(perf_path, perf_payload)
+            print(f"[perf_history] wrote path={perf_path}")
+        else:
+            print("[perf_history] skip write reason=missing_fields")
+    else:
+        print(f"[perf_history] skip write status={report.get('status')}")
 
     if strict and report["status"] != "PASS":
         raise RuntimeError("; ".join(report.get("reasons", []) or ["shadow_replay_failed"]))
