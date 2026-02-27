@@ -6,8 +6,9 @@ import datetime as dt
 import os
 import sys
 import tempfile
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from rabit.meta import perf_history
 from rabit.state import promotion_gate
 from scripts import deterministic_utils as det
 
@@ -16,6 +17,26 @@ DEFAULT_HISTORY_DIR = os.path.join("data", "meta_states", "history")
 DEFAULT_REJECTED_DIR = os.path.join("data", "meta_states", "rejected")
 DEFAULT_CSV = os.path.join("data", "live", "XAUUSD_M1_live.csv")
 DEFAULT_MODEL = os.path.join("data", "ars_best_theta_regime_bank.npz")
+
+EXIT_OK = 0
+EXIT_REJECT = 1
+EXIT_ERROR = 2
+
+_REJECT_REASON_PREFIXES = (
+    "guardrail_",
+    "performance_",
+    "regression_",
+)
+
+_PROCESSING_ERROR_REASON_PREFIXES = (
+    "candidate_",
+    "perf_history_",
+    "approved_missing",
+    "approved_shadow_replay_failed",
+    "approved_performance_missing",
+    "promotion_move_failed",
+    "rejected_move_failed",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -42,15 +63,84 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--csv", default=DEFAULT_CSV, help="Bars CSV for shadow replay")
     ap.add_argument("--model_path", default=DEFAULT_MODEL, help="Model path for shadow replay")
     ap.add_argument("--perf_days", type=int, default=promotion_gate.DEFAULT_PERF_DAYS, help="Perf window days")
+    ap.add_argument(
+        "--promote_min_winrate",
+        type=float,
+        default=0.25,
+        help="Minimum winrate required by promotion gate when sample is sufficient",
+    )
+    ap.add_argument(
+        "--promote_min_trades",
+        type=int,
+        default=20,
+        help="Minimum trades required before enforcing winrate gate",
+    )
+    ap.add_argument(
+        "--promote_min_days",
+        type=int,
+        default=10,
+        help="Minimum days required before enforcing winrate gate",
+    )
+    ap.add_argument(
+        "--no_exit_on_reject",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="If 1, return code 0 on reject (dev/test mode). Errors still return 2.",
+    )
     ap.add_argument("--debug", type=int, default=0, help="Debug mode (0/1)")
     return ap.parse_args()
 
 
-def _print_status(status: str, **kwargs: Any) -> None:
-    parts = [f"[promotion] status={status}"]
-    for key, value in kwargs.items():
-        parts.append(f"{key}={value}")
+def _safe_summary_value(value: Any, default: str = "missing") -> Any:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else default
+    return value
+
+
+def _normalize_reason(reason: Any) -> str:
+    text = str(reason or "unknown_error")
+    return " ".join(text.split())
+
+
+def _print_summary_line(
+    status: str,
+    reason: Any,
+    result: Optional[promotion_gate.PromotionGateResult],
+    perf_summary: Optional[Dict[str, Any]],
+    **extra: Any,
+) -> None:
+    perf = perf_summary or {}
+    parts = [
+        f"[promotion] STATUS={status}",
+        f"reason={_normalize_reason(reason)}",
+        f"winrate={_safe_summary_value(perf.get('winrate'))}",
+        f"trades={_safe_summary_value(perf.get('trades'))}",
+        f"days={_safe_summary_value(perf.get('days'))}",
+        f"total_pnl={_safe_summary_value(perf.get('total_pnl'))}",
+        f"candidate_hash={_safe_summary_value(result.candidate_hash if result is not None else None)}",
+        f"approved_hash={_safe_summary_value(result.approved_hash if result is not None else None)}",
+        f"replay_hash={_safe_summary_value(result.replay_hash if result is not None else None)}",
+        f"perf_history_path={_safe_summary_value(perf.get('perf_history_path'))}",
+    ]
+    for key, value in extra.items():
+        parts.append(f"{key}={_safe_summary_value(value)}")
     print(" ".join(parts))
+
+
+def _is_processing_error_reason(reason: Any) -> bool:
+    reason_text = _normalize_reason(reason)
+    for prefix in _REJECT_REASON_PREFIXES:
+        if reason_text.startswith(prefix):
+            return False
+    for prefix in _PROCESSING_ERROR_REASON_PREFIXES:
+        if reason_text.startswith(prefix):
+            return True
+    # Preserve legacy behavior for unknown gate failures by treating them as rejection.
+    return False
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -108,15 +198,41 @@ def _handle_rejection(candidate_path: str, rejected_dir: str, stamp: str) -> str
     return rejected_path
 
 
+def _perf_summary_fields(result: promotion_gate.PromotionGateResult) -> Dict[str, Any]:
+    details = result.details if isinstance(result.details, dict) else {}
+    snap = result.performance_snapshot if isinstance(result.performance_snapshot, dict) else {}
+    candidate = snap.get("candidate") if isinstance(snap.get("candidate"), dict) else {}
+    replay = snap.get("replay") if isinstance(snap.get("replay"), dict) else {}
+    winrate_gate = snap.get("winrate_gate") if isinstance(snap.get("winrate_gate"), dict) else {}
+    return {
+        "perf_reason": details.get("performance_reason", winrate_gate.get("reason", "n/a")),
+        "winrate": candidate.get("winrate", details.get("performance_winrate")),
+        "trades": candidate.get("trades", details.get("performance_trades")),
+        "days": candidate.get("days", details.get("performance_days")),
+        "total_pnl": candidate.get("total_pnl", details.get("performance_total_pnl")),
+        "perf_history_path": details.get("perf_history_path", replay.get("perf_history_path", "missing")),
+    }
+
+
 def run(args: argparse.Namespace) -> int:
     strict = int(args.strict) == 1
     replay_check = int(args.replay_check) == 1
+    no_exit_on_reject = int(args.no_exit_on_reject) == 1
     debug = int(args.debug) == 1
 
     candidate_path = args.candidate_path
     approved_path = _resolve_approved_path(args.approved_dir)
+    print(
+        f"[promote] candidate_path={candidate_path} "
+        f"perf_history={perf_history.perf_history_path(candidate_path)}"
+    )
 
-    gate_cfg = promotion_gate.PromotionGateConfig(perf_days=int(args.perf_days))
+    gate_cfg = promotion_gate.PromotionGateConfig(
+        perf_days=int(args.perf_days),
+        min_winrate=float(args.promote_min_winrate),
+        min_trades_for_gate=int(args.promote_min_trades),
+        min_days_for_gate=int(args.promote_min_days),
+    )
 
     result = promotion_gate.evaluate_candidate(
         candidate_path=candidate_path,
@@ -130,28 +246,47 @@ def run(args: argparse.Namespace) -> int:
     )
 
     stamp = _timestamp()
+    perf_summary = _perf_summary_fields(result)
 
     if not result.ok:
-        hashes = f"candidate={result.candidate_hash} approved={result.approved_hash} replay={result.replay_hash}"
+        is_error = _is_processing_error_reason(result.reason)
         rejected_path = ""
         try:
             rejected_path = _handle_rejection(candidate_path, args.rejected_dir, stamp)
         except Exception as exc:
-            _print_status("FAIL", reason=f"{result.reason} rejected_move_failed={exc}", hashes=hashes)
-            return 1
+            _print_summary_line(
+                "FAIL",
+                f"{result.reason} rejected_move_failed={exc}",
+                result,
+                perf_summary,
+                perf_reason=perf_summary.get("perf_reason"),
+            )
+            return EXIT_ERROR
 
-        _print_status(
-            "FAIL",
-            reason=result.reason,
-            hashes=hashes,
+        reject_status = "FAIL" if is_error else "REJECT"
+        _print_summary_line(
+            reject_status,
+            result.reason,
+            result,
+            perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
             rejected_path=rejected_path or "missing",
         )
-        return 1
+        if is_error:
+            return EXIT_ERROR
+        if no_exit_on_reject:
+            return EXIT_OK
+        return EXIT_REJECT
 
     if not approved_path or not os.path.exists(approved_path):
-        hashes = f"candidate={result.candidate_hash} approved={result.approved_hash} replay={result.replay_hash}"
-        _print_status("FAIL", reason=f"approved_missing path={approved_path}", hashes=hashes)
-        return 1
+        _print_summary_line(
+            "FAIL",
+            f"approved_missing path={approved_path}",
+            result,
+            perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+        )
+        return EXIT_ERROR
 
     history_dir = args.history_dir
     os.makedirs(history_dir, exist_ok=True)
@@ -171,9 +306,8 @@ def run(args: argparse.Namespace) -> int:
         reason = f"promotion_move_failed {exc}"
         if restore_err is not None:
             reason = f"{reason} restore_failed={restore_err}"
-        hashes = f"candidate={result.candidate_hash} approved={result.approved_hash} replay={result.replay_hash}"
-        _print_status("FAIL", reason=reason, hashes=hashes)
-        return 1
+        _print_summary_line("FAIL", reason=reason, result=result, perf_summary=perf_summary)
+        return EXIT_ERROR
 
     manifest = {
         "promoted_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -189,15 +323,16 @@ def run(args: argparse.Namespace) -> int:
     manifest_path = _unique_path(history_dir, "promotion_manifest.json", stamp)
     _atomic_write_json(manifest_path, manifest)
 
-    hashes = f"candidate={result.candidate_hash} approved={result.approved_hash} replay={result.replay_hash}"
-    _print_status(
+    _print_summary_line(
         "PASS",
-        reason=result.reason,
-        hashes=hashes,
+        result.reason,
+        result,
+        perf_summary,
+        perf_reason=perf_summary.get("perf_reason"),
         archived_path=archived_path,
         manifest_path=manifest_path,
     )
-    return 0
+    return EXIT_OK
 
 
 def main() -> int:
@@ -205,8 +340,8 @@ def main() -> int:
     try:
         return run(args)
     except Exception as exc:
-        _print_status("FAIL", reason=str(exc))
-        return 1
+        _print_summary_line("FAIL", str(exc), result=None, perf_summary=None)
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

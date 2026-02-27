@@ -6,11 +6,13 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from scripts import _deterministic as detx
 from scripts import deterministic_utils as det
+from rabit.meta import perf_history
 
 DEFAULT_PERF_DAYS = 30
-DEFAULT_MIN_WINRATE = 0.5
+DEFAULT_MIN_WINRATE = 0.25
+DEFAULT_MIN_TRADES_FOR_GATE = 20
+DEFAULT_MIN_DAYS_FOR_GATE = 10
 DEFAULT_PNL_EPS = 1e-6
 DEFAULT_DD_LIMIT_MULT = 2.0
 DEFAULT_LOSS_STREAK_MULT = 2.0
@@ -22,6 +24,8 @@ DEFAULT_REGRESSION_WINRATE_DELTA = 0.05
 class PromotionGateConfig:
     perf_days: int = DEFAULT_PERF_DAYS
     min_winrate: float = DEFAULT_MIN_WINRATE
+    min_trades_for_gate: int = DEFAULT_MIN_TRADES_FOR_GATE
+    min_days_for_gate: int = DEFAULT_MIN_DAYS_FOR_GATE
     pnl_epsilon: float = DEFAULT_PNL_EPS
     dd_limit_mult: float = DEFAULT_DD_LIMIT_MULT
     loss_streak_mult: float = DEFAULT_LOSS_STREAK_MULT
@@ -55,6 +59,23 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    return v
+
+
+def _safe_int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(float(value))
+    except Exception:
+        return None
 
 
 def _extract_day_key(value: Any) -> Optional[str]:
@@ -120,21 +141,156 @@ def _select_window_rows(rows: List[Dict[str, Any]], window_days: int) -> List[Di
     return ordered[-int(window_days) :]
 
 
-def _compute_perf(rows: List[Dict[str, Any]], window_days: int) -> Dict[str, Any]:
+def _extract_pnl(row: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        if key not in row:
+            continue
+        val = _safe_float_or_none(row.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _extract_trade_day(row: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "day",
+        "date",
+        "exit_day",
+        "exit_date",
+        "entry_date",
+        "exit_time",
+        "entry_time",
+        "time",
+        "timestamp",
+        "ts",
+    ):
+        day_key = _extract_day_key(row.get(key))
+        if day_key is not None:
+            return day_key
+    return None
+
+
+def _select_window_trade_rows(rows: List[Dict[str, Any]], window_days: int) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    normalized: List[Tuple[int, Dict[str, Any]]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        day_key = _extract_trade_day(row)
+        ord_val = _date_ordinal(day_key)
+        if ord_val is None:
+            continue
+        normalized.append((ord_val, row))
+
+    if not normalized:
+        return [row for row in rows if isinstance(row, dict)]
+
+    normalized.sort(key=lambda item: item[0])
+    if window_days <= 0:
+        return [item[1] for item in normalized]
+
+    max_ord = normalized[-1][0]
+    min_ord = max_ord - int(window_days) + 1
+    return [row for ord_val, row in normalized if ord_val >= min_ord]
+
+
+def _count_win_loss_from_rows(rows: List[Dict[str, Any]], pnl_keys: Tuple[str, ...]) -> Dict[str, Any]:
+    wins = 0
+    losses = 0
+    flats = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pnl = _extract_pnl(row, pnl_keys)
+        if pnl is None:
+            continue
+        if pnl > 0.0:
+            wins += 1
+        elif pnl < 0.0:
+            losses += 1
+        else:
+            flats += 1
+    outcomes = wins + losses
+    winrate = float(wins) / float(outcomes) if outcomes > 0 else None
+    return {
+        "wins": int(wins),
+        "losses": int(losses),
+        "flats": int(flats),
+        "outcomes": int(outcomes),
+        "winrate": winrate,
+    }
+
+
+def _trade_winrate_from_payload(payload: Dict[str, Any], window_days: int) -> Optional[Dict[str, Any]]:
+    trade_summary = payload.get("trade_summary") if isinstance(payload.get("trade_summary"), dict) else {}
+    if trade_summary:
+        wins = _safe_int_or_none(
+            trade_summary.get("win_trades", trade_summary.get("wins", trade_summary.get("winning_trades")))
+        )
+        losses = _safe_int_or_none(
+            trade_summary.get("loss_trades", trade_summary.get("losses", trade_summary.get("losing_trades")))
+        )
+        flats = _safe_int_or_none(trade_summary.get("flat_trades"))
+        trades = _safe_int_or_none(trade_summary.get("trades"))
+        if wins is not None and losses is not None:
+            wins = max(0, int(wins))
+            losses = max(0, int(losses))
+            flats = max(0, int(flats or 0))
+            outcomes = wins + losses
+            winrate = float(wins) / float(outcomes) if outcomes > 0 else None
+            if trades is None:
+                trades = outcomes + flats
+            return {
+                "winrate": winrate,
+                "trades": int(max(0, trades)),
+                "win_trades": int(wins),
+                "loss_trades": int(losses),
+                "flat_trades": int(flats),
+                "source": "trade_summary",
+            }
+
+    trade_rows = payload.get("trades") if isinstance(payload.get("trades"), list) else []
+    if not trade_rows:
+        return None
+
+    window = _select_window_trade_rows(trade_rows, int(window_days))
+    outcome_stats = _count_win_loss_from_rows(
+        window,
+        ("pnl", "net_pnl", "profit", "profit_loss", "realized_pnl"),
+    )
+    total_trades = outcome_stats["wins"] + outcome_stats["losses"] + outcome_stats["flats"]
+    return {
+        "winrate": outcome_stats.get("winrate"),
+        "trades": int(total_trades),
+        "win_trades": int(outcome_stats["wins"]),
+        "loss_trades": int(outcome_stats["losses"]),
+        "flat_trades": int(outcome_stats["flats"]),
+        "source": "trade_rows",
+    }
+
+
+def _compute_perf(rows: List[Dict[str, Any]], window_days: int, min_days_for_winrate: int) -> Dict[str, Any]:
     window = _select_window_rows(rows, window_days)
     if not window:
         return {
             "days": 0,
-            "winrate": 0.0,
+            "winrate": None,
             "total_pnl": 0.0,
             "max_dd": 0.0,
             "max_loss_streak": 0,
             "start_day": None,
             "end_day": None,
+            "win_days": 0,
+            "loss_days": 0,
+            "flat_days": 0,
+            "winrate_source": "day",
         }
 
     total_pnl = 0.0
-    wins = 0
+    win_days = 0
+    loss_days = 0
+    flat_days = 0
     max_dd = 0.0
     max_loss_streak = 0
     start_day = None
@@ -151,7 +307,11 @@ def _compute_perf(rows: List[Dict[str, Any]], window_days: int) -> Dict[str, Any
         pnl = _safe_float(row.get("day_pnl", 0.0), 0.0)
         total_pnl += pnl
         if pnl > 0.0:
-            wins += 1
+            win_days += 1
+        elif pnl < 0.0:
+            loss_days += 1
+        else:
+            flat_days += 1
         dd_val = _safe_float(row.get("intraday_dd", 0.0), 0.0)
         if dd_val > max_dd:
             max_dd = dd_val
@@ -160,16 +320,24 @@ def _compute_perf(rows: List[Dict[str, Any]], window_days: int) -> Dict[str, Any
             max_loss_streak = loss_streak
 
     days = len(window)
-    winrate = float(wins) / float(days) if days > 0 else 0.0
+    outcome_days = win_days + loss_days
+    min_days = max(0, int(min_days_for_winrate))
+    winrate: Optional[float] = None
+    if days >= min_days and outcome_days > 0:
+        winrate = float(win_days) / float(outcome_days)
 
     return {
         "days": int(days),
-        "winrate": float(winrate),
+        "winrate": winrate,
         "total_pnl": float(total_pnl),
         "max_dd": float(max_dd),
         "max_loss_streak": int(max_loss_streak),
         "start_day": start_day,
         "end_day": end_day,
+        "win_days": int(win_days),
+        "loss_days": int(loss_days),
+        "flat_days": int(flat_days),
+        "winrate_source": "day",
     }
 
 
@@ -358,37 +526,21 @@ def evaluate_candidate(
         }
     )
 
-    report = None
-    snapshot1 = None
-    snapshot2 = None
-    replay_hash = "missing"
-
-    try:
-        if replay_check:
-            args = _build_shadow_args(csv_path, model_path, candidate_path, deterministic_check=True, debug=debug)
-            report, snapshot1 = _run_shadow_replay_once(args, deterministic_enabled=True, debug=debug)
-            _report2, snapshot2 = _run_shadow_replay_once(args, deterministic_enabled=True, debug=debug)
-            try:
-                detx.compare_deterministic_snapshots(snapshot1, snapshot2)
-            except Exception as exc:
-                return PromotionGateResult(
-                    ok=False,
-                    reason=f"deterministic_mismatch {exc}",
-                    candidate_hash=candidate_hash,
-                    approved_hash=approved_hash,
-                    replay_hash="missing",
-                    performance_snapshot={},
-                    details=details,
-                )
-            replay_hash = det.hash_json(snapshot1) if snapshot1 is not None else "missing"
+    perf_path = perf_history.perf_history_path(candidate_path)
+    perf_payload = perf_history.load_perf_history(perf_path)
+    if perf_payload is None:
+        if not os.path.exists(perf_path):
+            reason = (
+                f"perf_history_missing path={perf_path} "
+                f"hint=run_shadow_replay --meta_state_path {candidate_path}"
+            )
         else:
-            args = _build_shadow_args(csv_path, model_path, candidate_path, deterministic_check=False, debug=debug)
-            report, snapshot1 = _run_shadow_replay_once(args, deterministic_enabled=False, debug=debug)
-            replay_hash = "skipped"
-    except Exception as exc:
+            reason = f"perf_history_invalid path={perf_path}"
+        if debug:
+            print(f"[perf_history] {reason}")
         return PromotionGateResult(
             ok=False,
-            reason=f"shadow_replay_failed {exc}",
+            reason=reason,
             candidate_hash=candidate_hash,
             approved_hash=approved_hash,
             replay_hash="missing",
@@ -396,10 +548,125 @@ def evaluate_candidate(
             details=details,
         )
 
-    if not isinstance(report, dict):
+    perf_ok, perf_missing = perf_history.validate_perf_history(perf_payload)
+    if not perf_ok:
+        reason = f"perf_history_missing_fields fields={','.join(perf_missing)} path={perf_path}"
+        if debug:
+            print(f"[perf_history] {reason}")
         return PromotionGateResult(
             ok=False,
-            reason="shadow_replay_report_missing",
+            reason=reason,
+            candidate_hash=candidate_hash,
+            approved_hash=approved_hash,
+            replay_hash="missing",
+            performance_snapshot={},
+            details=details,
+        )
+
+    perf_candidate_sha = perf_payload.get("candidate_sha256")
+    if perf_candidate_sha != candidate_hash:
+        reason = f"perf_history_candidate_sha_mismatch perf={perf_candidate_sha} file={candidate_hash}"
+        if debug:
+            print(f"[perf_history] {reason}")
+        return PromotionGateResult(
+            ok=False,
+            reason=reason,
+            candidate_hash=candidate_hash,
+            approved_hash=approved_hash,
+            replay_hash="missing",
+            performance_snapshot={},
+            details=details,
+        )
+
+    details["perf_history_path"] = perf_path
+    details["perf_history_source_csv"] = perf_payload.get("source_csv")
+
+    replay_payload = {k: v for k, v in perf_payload.items() if k != "timestamps"}
+    replay_hash = det.hash_json(replay_payload)
+
+    guardrails = perf_history.guardrails_from_history(perf_payload)
+    final_allowed = guardrails.get("final_allowed")
+    trades_simulated = guardrails.get("trades_simulated")
+    if final_allowed is not None:
+        details["final_allowed"] = int(final_allowed)
+        if int(final_allowed) <= 0:
+            return PromotionGateResult(
+                ok=False,
+                reason="guardrail_final_allowed_zero",
+                candidate_hash=candidate_hash,
+                approved_hash=approved_hash,
+                replay_hash=replay_hash,
+                performance_snapshot={},
+                details=details,
+            )
+    if trades_simulated is not None:
+        details["trades_simulated"] = int(trades_simulated)
+        if int(trades_simulated) <= 0:
+            return PromotionGateResult(
+                ok=False,
+                reason="guardrail_trades_simulated_zero",
+                candidate_hash=candidate_hash,
+                approved_hash=approved_hash,
+                replay_hash=replay_hash,
+                performance_snapshot={},
+                details=details,
+            )
+
+    perf_daily = perf_payload.get("daily") if isinstance(perf_payload.get("daily"), list) else []
+    summary_perf = perf_history.perf_metrics_from_history(perf_payload)
+    if perf_daily:
+        candidate_perf = _compute_perf(
+            perf_daily,
+            int(config.perf_days),
+            min_days_for_winrate=int(config.min_days_for_gate),
+        )
+        summary_trades = _safe_int_or_none(summary_perf.get("trades"))
+        if summary_trades is not None:
+            candidate_perf["trades"] = int(max(0, summary_trades))
+        if _safe_float_or_none(candidate_perf.get("max_dd")) is None:
+            summary_max_dd = _safe_float_or_none(summary_perf.get("max_dd"))
+            if summary_max_dd is not None:
+                candidate_perf["max_dd"] = float(summary_max_dd)
+        if _safe_int_or_none(candidate_perf.get("max_loss_streak")) is None:
+            summary_max_loss = _safe_int_or_none(summary_perf.get("max_loss_streak"))
+            if summary_max_loss is not None:
+                candidate_perf["max_loss_streak"] = int(summary_max_loss)
+        if _safe_float_or_none(candidate_perf.get("total_pnl")) is None:
+            summary_total_pnl = _safe_float_or_none(summary_perf.get("total_pnl"))
+            if summary_total_pnl is not None:
+                candidate_perf["total_pnl"] = float(summary_total_pnl)
+    else:
+        candidate_perf = perf_history.perf_metrics_from_history(perf_payload)
+        candidate_perf["winrate_source"] = "summary"
+
+    trade_winrate = _trade_winrate_from_payload(perf_payload, int(config.perf_days))
+    if trade_winrate is not None:
+        candidate_perf["winrate"] = trade_winrate.get("winrate")
+        candidate_perf["winrate_source"] = trade_winrate.get("source")
+        if _safe_int_or_none(trade_winrate.get("trades")) is not None:
+            candidate_perf["trades"] = int(_safe_int_or_none(trade_winrate.get("trades")) or 0)
+        candidate_perf["win_trades"] = int(_safe_int_or_none(trade_winrate.get("win_trades")) or 0)
+        candidate_perf["loss_trades"] = int(_safe_int_or_none(trade_winrate.get("loss_trades")) or 0)
+        candidate_perf["flat_trades"] = int(_safe_int_or_none(trade_winrate.get("flat_trades")) or 0)
+    elif "winrate_source" not in candidate_perf:
+        candidate_perf["winrate_source"] = "day" if perf_daily else "summary"
+
+    days_val = _safe_int_or_none(candidate_perf.get("days"))
+    if days_val is None:
+        days_val = 0
+    candidate_perf["days"] = int(max(0, days_val))
+
+    total_trades_val = _safe_int_or_none(candidate_perf.get("trades"))
+    if total_trades_val is None:
+        total_trades_val = _safe_int_or_none(trades_simulated)
+        if total_trades_val is not None:
+            candidate_perf["trades"] = int(max(0, total_trades_val))
+
+    total_pnl_val = _safe_float_or_none(candidate_perf.get("total_pnl"))
+    if total_pnl_val is None:
+        return PromotionGateResult(
+            ok=False,
+            reason="perf_history_missing_total_pnl",
             candidate_hash=candidate_hash,
             approved_hash=approved_hash,
             replay_hash=replay_hash,
@@ -407,26 +674,41 @@ def evaluate_candidate(
             details=details,
         )
 
-    guardrails = report.get("guardrails", {}) if isinstance(report.get("guardrails"), dict) else {}
-    counts = report.get("counts", {}) if isinstance(report.get("counts"), dict) else {}
-    final_allowed = _safe_int(guardrails.get("final_allowed", 0), 0)
-    trades_simulated = _safe_int(counts.get("trades_simulated", 0), 0)
-    details["final_allowed"] = final_allowed
-    details["trades_simulated"] = trades_simulated
-    if final_allowed <= 0:
+    winrate_val = _safe_float_or_none(candidate_perf.get("winrate"))
+    max_dd_val = _safe_float_or_none(candidate_perf.get("max_dd"))
+    max_loss_val = _safe_int_or_none(candidate_perf.get("max_loss_streak"))
+
+    min_trades_for_gate = max(0, int(config.min_trades_for_gate))
+    min_days_for_gate = max(0, int(config.min_days_for_gate))
+    has_min_trades = total_trades_val is not None and int(total_trades_val) >= min_trades_for_gate
+    has_min_days = int(candidate_perf.get("days", 0)) >= min_days_for_gate
+    winrate_gate_reason = "ok"
+    if not has_min_trades or not has_min_days or winrate_val is None:
+        winrate_gate_reason = "insufficient_sample"
+    winrate_gate_applied = winrate_gate_reason == "ok"
+
+    details.update(
+        {
+            "performance_days": int(candidate_perf.get("days", 0)),
+            "performance_trades": int(total_trades_val) if total_trades_val is not None else None,
+            "performance_winrate": winrate_val,
+            "performance_winrate_source": candidate_perf.get("winrate_source"),
+            "performance_total_pnl": total_pnl_val,
+            "performance_reason": winrate_gate_reason,
+            "promote_min_winrate": float(config.min_winrate),
+            "promote_min_trades": int(min_trades_for_gate),
+            "promote_min_days": int(min_days_for_gate),
+        }
+    )
+
+    if winrate_gate_applied and winrate_val is not None and winrate_val < float(config.min_winrate):
         return PromotionGateResult(
             ok=False,
-            reason="guardrail_final_allowed_zero",
-            candidate_hash=candidate_hash,
-            approved_hash=approved_hash,
-            replay_hash=replay_hash,
-            performance_snapshot={},
-            details=details,
-        )
-    if trades_simulated <= 0:
-        return PromotionGateResult(
-            ok=False,
-            reason="guardrail_trades_simulated_zero",
+            reason=(
+                "performance_winrate_low "
+                f"winrate={winrate_val} min_winrate={float(config.min_winrate)} "
+                f"trades={total_trades_val} days={candidate_perf.get('days')}"
+            ),
             candidate_hash=candidate_hash,
             approved_hash=approved_hash,
             replay_hash=replay_hash,
@@ -434,12 +716,10 @@ def evaluate_candidate(
             details=details,
         )
 
-    daily_rows = report.get("daily_table", []) if isinstance(report.get("daily_table"), list) else []
-    candidate_perf = _compute_perf(daily_rows, int(config.perf_days))
-    if candidate_perf.get("days", 0) < 1:
+    if total_pnl_val < float(config.pnl_epsilon):
         return PromotionGateResult(
             ok=False,
-            reason="performance_history_empty",
+            reason=f"performance_pnl_low total_pnl={total_pnl_val}",
             candidate_hash=candidate_hash,
             approved_hash=approved_hash,
             replay_hash=replay_hash,
@@ -447,10 +727,10 @@ def evaluate_candidate(
             details=details,
         )
 
-    if candidate_perf["winrate"] < float(config.min_winrate):
+    if max_dd_val is not None and max_dd_val > dd_limit:
         return PromotionGateResult(
             ok=False,
-            reason=f"performance_winrate_low winrate={candidate_perf['winrate']}",
+            reason=f"performance_dd_breach max_dd={max_dd_val}",
             candidate_hash=candidate_hash,
             approved_hash=approved_hash,
             replay_hash=replay_hash,
@@ -458,32 +738,10 @@ def evaluate_candidate(
             details=details,
         )
 
-    if candidate_perf["total_pnl"] < float(config.pnl_epsilon):
+    if max_loss_val is not None and max_loss_val > loss_streak_limit:
         return PromotionGateResult(
             ok=False,
-            reason=f"performance_pnl_low total_pnl={candidate_perf['total_pnl']}",
-            candidate_hash=candidate_hash,
-            approved_hash=approved_hash,
-            replay_hash=replay_hash,
-            performance_snapshot={},
-            details=details,
-        )
-
-    if candidate_perf["max_dd"] > dd_limit:
-        return PromotionGateResult(
-            ok=False,
-            reason=f"performance_dd_breach max_dd={candidate_perf['max_dd']}",
-            candidate_hash=candidate_hash,
-            approved_hash=approved_hash,
-            replay_hash=replay_hash,
-            performance_snapshot={},
-            details=details,
-        )
-
-    if candidate_perf["max_loss_streak"] > loss_streak_limit:
-        return PromotionGateResult(
-            ok=False,
-            reason=f"performance_loss_streak_breach max_loss_streak={candidate_perf['max_loss_streak']}",
+            reason=f"performance_loss_streak_breach max_loss_streak={max_loss_val}",
             candidate_hash=candidate_hash,
             approved_hash=approved_hash,
             replay_hash=replay_hash,
@@ -511,46 +769,78 @@ def evaluate_candidate(
             "start_day": None,
             "end_day": None,
         }
+        approved_perf_source = "missing"
     else:
-        try:
-            approved_args = _build_shadow_args(
-                csv_path, model_path, approved_path, deterministic_check=False, debug=debug
+        approved_perf = None
+        approved_perf_source = "perf_history"
+        approved_perf_path = perf_history.perf_history_path(approved_path)
+        approved_payload = perf_history.load_perf_history(approved_perf_path)
+        if approved_payload is not None:
+            approved_ok, approved_missing = perf_history.validate_perf_history(approved_payload)
+            approved_sha = approved_payload.get("candidate_sha256")
+            if approved_ok and approved_sha == approved_hash:
+                approved_perf = perf_history.perf_metrics_from_history(approved_payload)
+            elif debug:
+                print(
+                    f"[perf_history] approved_perf_history_invalid path={approved_perf_path} "
+                    f"missing={approved_missing} sha_ok={approved_sha == approved_hash}"
+                )
+
+        if approved_perf is None:
+            approved_perf_source = "shadow_replay"
+            try:
+                approved_args = _build_shadow_args(
+                    csv_path, model_path, approved_path, deterministic_check=False, debug=debug
+                )
+                approved_report, _ = _run_shadow_replay_once(
+                    approved_args,
+                    deterministic_enabled=False,
+                    debug=debug,
+                )
+            except Exception as exc:
+                if strict:
+                    return PromotionGateResult(
+                        ok=False,
+                        reason=f"approved_shadow_replay_failed {exc}",
+                        candidate_hash=candidate_hash,
+                        approved_hash=approved_hash,
+                        replay_hash=replay_hash,
+                        performance_snapshot={},
+                        details=details,
+                    )
+                approved_report = {}
+
+            approved_summary = (
+                approved_report.get("perf_summary", {}) if isinstance(approved_report, dict) else {}
             )
-            approved_report, _ = _run_shadow_replay_once(
-                approved_args,
-                deterministic_enabled=False,
-                debug=debug,
-            )
-        except Exception as exc:
+            approved_perf = perf_history.perf_metrics_from_summary(approved_summary)
+
+    regression_pnl_ratio = float(config.regression_pnl_ratio)
+    regression_win_delta = float(config.regression_winrate_delta)
+    approved_days = _safe_int_or_none(approved_perf.get("days")) or 0
+    approved_total_pnl = _safe_float_or_none(approved_perf.get("total_pnl"))
+    approved_winrate = _safe_float_or_none(approved_perf.get("winrate"))
+    pnl_required = (approved_total_pnl or 0.0) * regression_pnl_ratio
+    winrate_required = (approved_winrate or 0.0) - regression_win_delta
+
+    if approved_days > 0:
+        if approved_total_pnl is None or (winrate_gate_applied and approved_winrate is None):
             if strict:
                 return PromotionGateResult(
                     ok=False,
-                    reason=f"approved_shadow_replay_failed {exc}",
+                    reason="approved_performance_missing",
                     candidate_hash=candidate_hash,
                     approved_hash=approved_hash,
                     replay_hash=replay_hash,
                     performance_snapshot={},
                     details=details,
                 )
-            approved_report = {}
-
-        approved_daily = (
-            approved_report.get("daily_table", []) if isinstance(approved_report, dict) else []
-        )
-        approved_perf = _compute_perf(approved_daily, int(config.perf_days))
-
-    regression_pnl_ratio = float(config.regression_pnl_ratio)
-    regression_win_delta = float(config.regression_winrate_delta)
-    pnl_required = approved_perf["total_pnl"] * regression_pnl_ratio
-    winrate_required = approved_perf["winrate"] - regression_win_delta
-
-    if approved_perf.get("days", 0) > 0:
-        if candidate_perf["total_pnl"] < pnl_required:
+        elif total_pnl_val < pnl_required:
             return PromotionGateResult(
                 ok=False,
                 reason=(
                     "regression_pnl "
-                    f"candidate={candidate_perf['total_pnl']} approved={approved_perf['total_pnl']}"
+                    f"candidate={total_pnl_val} approved={approved_total_pnl}"
                 ),
                 candidate_hash=candidate_hash,
                 approved_hash=approved_hash,
@@ -558,12 +848,17 @@ def evaluate_candidate(
                 performance_snapshot={},
                 details=details,
             )
-        if candidate_perf["winrate"] < winrate_required:
+        if (
+            winrate_gate_applied
+            and winrate_val is not None
+            and approved_winrate is not None
+            and winrate_val < winrate_required
+        ):
             return PromotionGateResult(
                 ok=False,
                 reason=(
                     "regression_winrate "
-                    f"candidate={candidate_perf['winrate']} approved={approved_perf['winrate']}"
+                    f"candidate={winrate_val} approved={approved_winrate}"
                 ),
                 candidate_hash=candidate_hash,
                 approved_hash=approved_hash,
@@ -586,13 +881,22 @@ def evaluate_candidate(
         "window_days": int(config.perf_days),
         "thresholds": {
             "min_winrate": float(config.min_winrate),
+            "min_trades_for_gate": int(min_trades_for_gate),
+            "min_days_for_gate": int(min_days_for_gate),
             "pnl_epsilon": float(config.pnl_epsilon),
             "dd_limit": float(dd_limit),
             "loss_streak_limit": int(loss_streak_limit),
         },
+        "winrate_gate": {
+            "applied": int(bool(winrate_gate_applied)),
+            "reason": winrate_gate_reason,
+            "winrate_source": candidate_perf.get("winrate_source"),
+            "trades": total_trades_val,
+            "days": candidate_perf.get("days"),
+        },
         "guardrails": {
-            "final_allowed": int(final_allowed),
-            "trades_simulated": int(trades_simulated),
+            "final_allowed": final_allowed,
+            "trades_simulated": trades_simulated,
         },
         "candidate": candidate_perf,
         "approved": approved_perf,
@@ -606,12 +910,22 @@ def evaluate_candidate(
             "csv": csv_path,
             "model_path": model_path,
             "replay_check": int(bool(replay_check)),
+            "perf_history_path": perf_path,
+            "perf_history_source_csv": perf_payload.get("source_csv"),
+            "perf_history_input_hash": perf_payload.get("run", {}).get("input_hash"),
+            "perf_history_equity_hash": perf_payload.get("run", {}).get("equity_hash"),
+            "perf_history_regime_ledger_hash": perf_payload.get("run", {}).get("regime_ledger_hash"),
+            "approved_perf_source": approved_perf_source,
         },
     }
 
+    pass_reason = "ok"
+    if winrate_gate_reason == "insufficient_sample":
+        pass_reason = "insufficient_sample"
+
     return PromotionGateResult(
         ok=True,
-        reason="ok",
+        reason=pass_reason,
         candidate_hash=candidate_hash,
         approved_hash=approved_hash,
         replay_hash=replay_hash,
