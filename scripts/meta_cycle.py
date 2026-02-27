@@ -15,9 +15,11 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-EXIT_OK = 0
-EXIT_REJECT = 1
-EXIT_ERROR = 2
+from rabit.state.exit_codes import ExitCode
+
+EXIT_OK = ExitCode.SUCCESS
+EXIT_REJECT = ExitCode.BUSINESS_REJECT
+EXIT_ERROR = ExitCode.INTERNAL_ERROR
 
 DEFAULT_APPROVED_STATE_PATH = os.path.join("data", "meta_states", "current_approved", "meta_risk_state.json")
 DEFAULT_CANDIDATE_PATH = os.path.join("data", "meta_states", "candidate", "meta_risk_state.json")
@@ -374,6 +376,9 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
                     ]
                 )
             step3 = _run_module("meta_promote", "scripts.meta_promote", promote_cli)
+            if step3.return_code >= ExitCode.DATA_INVALID:
+                cycle_status = "FAIL"
+                return int(step3.return_code)
             if step3.return_code == EXIT_ERROR:
                 cycle_status = "FAIL"
                 return EXIT_ERROR
@@ -403,7 +408,7 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
 
             if strict and not dry_run and decision == "REJECTED":
                 _log("strict_reject=1 -> stop_before_post_validation")
-                cycle_status = "REJECT"
+                cycle_status = "SUCCESS_WITH_REJECT"
                 return EXIT_REJECT
 
             if decision == "REJECTED" and not strict:

@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from rabit.meta import perf_history
 from rabit.state import promotion_gate
+from rabit.state.exit_codes import ExitCode
 from scripts import deterministic_utils as det
 
 DEFAULT_APPROVED_DIR = os.path.join("data", "meta_states", "current_approved")
@@ -21,9 +22,9 @@ DEFAULT_LEDGER_PATH = os.path.join("data", "meta_states", "ledger.jsonl")
 DEFAULT_CSV = os.path.join("data", "live", "XAUUSD_M1_live.csv")
 DEFAULT_MODEL = os.path.join("data", "ars_best_theta_regime_bank.npz")
 
-EXIT_OK = 0
-EXIT_REJECT = 1
-EXIT_ERROR = 2
+EXIT_OK = ExitCode.SUCCESS
+EXIT_REJECT = ExitCode.BUSINESS_REJECT
+EXIT_ERROR = ExitCode.INTERNAL_ERROR
 
 _REJECT_REASON_PREFIXES = (
     "guardrail_",
@@ -31,12 +32,15 @@ _REJECT_REASON_PREFIXES = (
     "regression_",
 )
 
-_PROCESSING_ERROR_REASON_PREFIXES = (
+_DATA_INVALID_REASON_PREFIXES = (
     "candidate_",
     "perf_history_",
     "approved_missing",
     "approved_shadow_replay_failed",
     "approved_performance_missing",
+)
+
+_STATE_CORRUPT_REASON_PREFIXES = (
     "history_archive_failed",
     "atomic_replace_failed",
     "ledger_write_failed",
@@ -143,16 +147,21 @@ def _print_summary_line(
     print(" ".join(parts))
 
 
-def _is_processing_error_reason(reason: Any) -> bool:
+def _processing_error_exit_code(reason: Any) -> int | None:
     reason_text = _normalize_reason(reason)
     for prefix in _REJECT_REASON_PREFIXES:
         if reason_text.startswith(prefix):
-            return False
-    for prefix in _PROCESSING_ERROR_REASON_PREFIXES:
+            return None
+    for prefix in _DATA_INVALID_REASON_PREFIXES:
         if reason_text.startswith(prefix):
-            return True
+            return ExitCode.DATA_INVALID
+    for prefix in _STATE_CORRUPT_REASON_PREFIXES:
+        if reason_text.startswith(prefix):
+            return ExitCode.STATE_CORRUPT
+    if "corrupt" in reason_text:
+        return ExitCode.STATE_CORRUPT
     # Preserve legacy behavior for unknown gate failures by treating them as rejection.
-    return False
+    return None
 
 
 def _utc_iso() -> str:
@@ -443,8 +452,8 @@ def run(args: argparse.Namespace) -> int:
     base_hash = result.approved_hash if result is not None else "missing"
 
     if not result.ok:
-        is_error = _is_processing_error_reason(result.reason)
-        if is_error:
+        processing_error_exit_code = _processing_error_exit_code(result.reason)
+        if processing_error_exit_code is not None:
             _print_summary_line(
                 "FAIL",
                 result.reason,
@@ -452,7 +461,7 @@ def run(args: argparse.Namespace) -> int:
                 perf_summary,
                 perf_reason=perf_summary.get("perf_reason"),
             )
-            return EXIT_ERROR
+            return int(processing_error_exit_code)
 
         try:
             perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
@@ -472,7 +481,7 @@ def run(args: argparse.Namespace) -> int:
                 perf_summary,
                 perf_reason=perf_summary.get("perf_reason"),
             )
-            return EXIT_ERROR
+            return ExitCode.STATE_CORRUPT
 
         rejected_path = ""
         try:
@@ -485,7 +494,7 @@ def run(args: argparse.Namespace) -> int:
                 perf_summary,
                 perf_reason=perf_summary.get("perf_reason"),
             )
-            return EXIT_ERROR
+            return ExitCode.STATE_CORRUPT
 
         try:
             _append_ledger_entry(args.ledger_path, ledger_entry)
@@ -506,7 +515,7 @@ def run(args: argparse.Namespace) -> int:
                 perf_summary,
                 perf_reason=perf_summary.get("perf_reason"),
             )
-            return EXIT_ERROR
+            return ExitCode.STATE_CORRUPT
 
         _print_summary_line(
             "REJECT",
@@ -529,7 +538,7 @@ def run(args: argparse.Namespace) -> int:
             perf_summary,
             perf_reason=perf_summary.get("perf_reason"),
         )
-        return EXIT_ERROR
+        return ExitCode.DATA_INVALID
 
     try:
         perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
@@ -541,7 +550,7 @@ def run(args: argparse.Namespace) -> int:
             perf_summary=perf_summary,
             perf_reason=perf_summary.get("perf_reason"),
         )
-        return EXIT_ERROR
+        return ExitCode.DATA_INVALID
 
     try:
         archived_path = _atomic_promote(
@@ -559,7 +568,7 @@ def run(args: argparse.Namespace) -> int:
             perf_summary=perf_summary,
             perf_reason=perf_summary.get("perf_reason"),
         )
-        return EXIT_ERROR
+        return ExitCode.STATE_CORRUPT
 
     try:
         ledger_entry = _build_ledger_entry(
@@ -586,7 +595,7 @@ def run(args: argparse.Namespace) -> int:
             perf_summary=perf_summary,
             perf_reason=perf_summary.get("perf_reason"),
         )
-        return EXIT_ERROR
+        return ExitCode.STATE_CORRUPT
 
     manifest = {
         "promoted_at": _utc_iso(),
@@ -624,7 +633,7 @@ def main() -> int:
         return run(args)
     except Exception as exc:
         _print_summary_line("FAIL", str(exc), result=None, perf_summary=None)
-        return EXIT_ERROR
+        return ExitCode.INTERNAL_ERROR
 
 
 if __name__ == "__main__":

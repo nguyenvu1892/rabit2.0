@@ -23,10 +23,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-EXIT_OK = 0
-EXIT_REJECT = 1
-EXIT_ERROR = 2
-EXIT_LOCKED = 3
+from rabit.state.exit_codes import ExitCode
+
+EXIT_OK = ExitCode.SUCCESS
+EXIT_REJECT = ExitCode.BUSINESS_REJECT
+EXIT_ERROR = ExitCode.INTERNAL_ERROR
+EXIT_LOCKED = ExitCode.LOCK_TIMEOUT
 
 DEFAULT_LOCK_PATH = os.path.join("data", "meta_states", ".locks", "meta_cycle.lock")
 DEFAULT_AUDIT_LOG_PATH = os.path.join("data", "reports", "meta_schedule.jsonl")
@@ -146,8 +148,27 @@ def _normalize_cycle_status(raw_status: str, decision: str, dry_run: bool, retur
             return "SUCCESS_WITH_PROMOTE"
         return "SUCCESS"
     if return_code == EXIT_REJECT:
-        return "REJECT"
+        return "SUCCESS_WITH_REJECT"
     return "FAIL"
+
+
+def _is_business_reject_outcome(cycle_result: Optional[CycleExecResult]) -> bool:
+    if cycle_result is None:
+        return False
+    if int(cycle_result.return_code) == ExitCode.BUSINESS_REJECT:
+        return True
+    if str(cycle_result.decision).strip().upper() == "REJECTED":
+        return True
+    if str(cycle_result.cycle_status).strip().upper() == "SUCCESS_WITH_REJECT":
+        return True
+    return False
+
+
+def _scheduler_status_from_return_code(return_code: int) -> str:
+    rc = int(return_code)
+    if rc in (ExitCode.SUCCESS, ExitCode.BUSINESS_REJECT):
+        return "OK"
+    return "ERROR"
 
 
 def _read_lock_payload(lock_path: str) -> Dict[str, Any]:
@@ -495,7 +516,7 @@ def _run_once(args: argparse.Namespace, stale_seconds: float) -> int:
             strict=int(args.strict),
             dry_run=int(args.dry_run),
         )
-        scheduler_status = "OK" if cycle_result.return_code == EXIT_OK else "ERROR"
+        scheduler_status = _scheduler_status_from_return_code(cycle_result.return_code)
         record = _build_audit_record(
             args=args,
             mode="run_once",
@@ -506,6 +527,9 @@ def _run_once(args: argparse.Namespace, stale_seconds: float) -> int:
             scheduler_runtime_seconds=time.perf_counter() - sched_t0,
         )
         _append_audit_record(args.audit_log_path, record)
+        if _is_business_reject_outcome(cycle_result):
+            _log("business_reject_not_error")
+            return EXIT_OK
         return int(cycle_result.return_code)
     finally:
         released = _release_lock(lock)
@@ -574,7 +598,7 @@ def _run_interval_loop(args: argparse.Namespace, stale_seconds: float) -> int:
                 strict=int(args.strict),
                 dry_run=int(args.dry_run),
             )
-            scheduler_status = "OK" if cycle_result.return_code == EXIT_OK else "ERROR"
+            scheduler_status = _scheduler_status_from_return_code(cycle_result.return_code)
             record = _build_audit_record(
                 args=args,
                 mode="interval",
@@ -588,6 +612,11 @@ def _run_interval_loop(args: argparse.Namespace, stale_seconds: float) -> int:
         finally:
             released = _release_lock(lock)
             _log(f"release_lock path={args.lock_path} removed={1 if released else 0}")
+
+        if _is_business_reject_outcome(cycle_result):
+            _log("business_reject_not_error")
+        if cycle_result is not None and int(cycle_result.return_code) >= ExitCode.DATA_INVALID:
+            return int(cycle_result.return_code)
 
         if not _sleep_interval(interval_seconds, tick_t0, max_runtime_seconds, loop_t0):
             _log("max_runtime_reached=1 -> stop")
