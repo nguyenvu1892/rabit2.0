@@ -26,3 +26,8 @@ data/reports/**/*.json
 data/reports/**/*.jsonl
 data/snapshots/**
 *.log
+
+# Meta-state candidates/history (generated artifacts)
+data/meta_states/candidate/**
+data/meta_states/history/**
+data/meta_states/rejected/**
