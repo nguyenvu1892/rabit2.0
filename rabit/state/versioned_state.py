@@ -9,6 +9,21 @@ DEFAULT_BASE_DIR = os.path.join("data", "meta_states")
 DEFAULT_STATE_FILE = "meta_risk_state.json"
 
 
+def _norm_path(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(path))
+    except Exception:
+        return path
+
+
+def _same_path(left: Optional[str], right: Optional[str]) -> bool:
+    if not left or not right:
+        return False
+    return _norm_path(left) == _norm_path(right)
+
+
 def ensure_state_dirs(base_dir: str = DEFAULT_BASE_DIR) -> Dict[str, str]:
     paths = {
         "base": base_dir,
@@ -92,8 +107,24 @@ def load_approved_state(
     ensure_state_dirs(base_dir)
     approved_path = approved_state_path(base_dir)
     legacy_path = legacy_path or legacy_state_path()
+    legacy_default = legacy_state_path()
+
+    explicit_override = False
+    if legacy_path and not _same_path(legacy_path, approved_path) and not _same_path(legacy_path, legacy_default):
+        explicit_override = True
 
     load_errors: List[str] = []
+    if explicit_override:
+        if not os.path.exists(legacy_path):
+            return None, "", f"explicit_state_missing path={legacy_path}"
+        try:
+            state = MetaRiskState.load_json(cfg, legacy_path)
+            if state is not None:
+                return state, legacy_path, None
+            return None, "", "explicit_state_invalid"
+        except Exception as exc:
+            return None, "", f"explicit_state_error={exc}"
+
     if approved_path and os.path.exists(approved_path):
         try:
             state = MetaRiskState.load_json(cfg, approved_path)
