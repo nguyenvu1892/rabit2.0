@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
+import subprocess
 import sys
 import tempfile
 from typing import Any, Dict, Optional
@@ -15,6 +17,7 @@ from scripts import deterministic_utils as det
 DEFAULT_APPROVED_DIR = os.path.join("data", "meta_states", "current_approved")
 DEFAULT_HISTORY_DIR = os.path.join("data", "meta_states", "history")
 DEFAULT_REJECTED_DIR = os.path.join("data", "meta_states", "rejected")
+DEFAULT_LEDGER_PATH = os.path.join("data", "meta_states", "ledger.jsonl")
 DEFAULT_CSV = os.path.join("data", "live", "XAUUSD_M1_live.csv")
 DEFAULT_MODEL = os.path.join("data", "ars_best_theta_regime_bank.npz")
 
@@ -34,6 +37,10 @@ _PROCESSING_ERROR_REASON_PREFIXES = (
     "approved_missing",
     "approved_shadow_replay_failed",
     "approved_performance_missing",
+    "history_archive_failed",
+    "atomic_replace_failed",
+    "ledger_write_failed",
+    "ledger_entry_failed",
     "promotion_move_failed",
     "rejected_move_failed",
 )
@@ -56,6 +63,11 @@ def _parse_args() -> argparse.Namespace:
         "--rejected_dir",
         default=DEFAULT_REJECTED_DIR,
         help="Directory for rejected candidates",
+    )
+    ap.add_argument(
+        "--ledger_path",
+        default=DEFAULT_LEDGER_PATH,
+        help="Append-only promotion ledger path (JSONL)",
     )
     ap.add_argument("--strict", type=int, default=1, help="Strict mode (0/1)")
     ap.add_argument("--reason", required=True, help="Promotion reason string")
@@ -143,6 +155,11 @@ def _is_processing_error_reason(reason: Any) -> bool:
     return False
 
 
+def _utc_iso() -> str:
+    now = dt.datetime.now(dt.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     dir_path = os.path.dirname(path)
     if dir_path:
@@ -152,6 +169,55 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(det.stable_json_dumps(payload))
         os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _atomic_copy_file(src: str, dest: str) -> None:
+    if not src or not os.path.exists(src):
+        raise RuntimeError(f"source_missing path={src}")
+    dest_dir = os.path.dirname(dest)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+    if os.path.exists(dest):
+        raise RuntimeError(f"destination_exists path={dest}")
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=dest_dir or None)
+    try:
+        with open(src, "rb") as fsrc, os.fdopen(fd, "wb") as fdst:
+            for chunk in iter(lambda: fsrc.read(1024 * 1024), b""):
+                fdst.write(chunk)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        os.replace(tmp_path, dest)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _atomic_replace_from_source(src: str, dest: str) -> None:
+    if not src or not os.path.exists(src):
+        raise RuntimeError(f"source_missing path={src}")
+    dest_dir = os.path.dirname(dest)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_promote_", suffix=".json", dir=dest_dir or None)
+    try:
+        with open(src, "rb") as fsrc, os.fdopen(fd, "wb") as fdst:
+            for chunk in iter(lambda: fsrc.read(1024 * 1024), b""):
+                fdst.write(chunk)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        # Atomic replace on same filesystem because temp file is in destination directory.
+        os.replace(tmp_path, dest)
     finally:
         try:
             if os.path.exists(tmp_path):
@@ -184,7 +250,9 @@ def _resolve_approved_path(approved_dir: str) -> str:
 
 
 def _move_file(src: str, dest: str) -> None:
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    dest_dir = os.path.dirname(dest)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
     if os.path.exists(dest):
         raise RuntimeError(f"destination_exists path={dest}")
     os.replace(src, dest)
@@ -210,8 +278,133 @@ def _perf_summary_fields(result: promotion_gate.PromotionGateResult) -> Dict[str
         "trades": candidate.get("trades", details.get("performance_trades")),
         "days": candidate.get("days", details.get("performance_days")),
         "total_pnl": candidate.get("total_pnl", details.get("performance_total_pnl")),
+        "drawdown": candidate.get("max_dd"),
         "perf_history_path": details.get("perf_history_path", replay.get("perf_history_path", "missing")),
     }
+
+
+def _git_commit_hash() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit = (result.stdout or "").strip()
+        return commit or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _load_valid_perf_history(candidate_path: str, candidate_hash: str) -> tuple[str, Dict[str, Any]]:
+    perf_path = perf_history.perf_history_path(candidate_path)
+    payload = perf_history.load_perf_history(perf_path)
+    if payload is None:
+        if not os.path.exists(perf_path):
+            raise RuntimeError(f"perf_history_missing path={perf_path}")
+        raise RuntimeError(f"perf_history_invalid path={perf_path}")
+
+    ok, missing = perf_history.validate_perf_history(payload)
+    if not ok:
+        raise RuntimeError(f"perf_history_missing_fields fields={','.join(missing)} path={perf_path}")
+
+    perf_candidate_hash = payload.get("candidate_sha256")
+    if perf_candidate_hash != candidate_hash:
+        raise RuntimeError(
+            f"perf_history_candidate_sha_mismatch perf={perf_candidate_hash} file={candidate_hash}"
+        )
+    return perf_path, payload
+
+
+def _deterministic_hash_from_perf_history(payload: Dict[str, Any]) -> str:
+    run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
+    data = {
+        "candidate_sha256": payload.get("candidate_sha256"),
+        "input_hash": run.get("input_hash"),
+        "equity_hash": run.get("equity_hash"),
+        "regime_ledger_hash": run.get("regime_ledger_hash"),
+    }
+    return det.hash_json(data)
+
+
+def _ledger_metrics(
+    perf_payload: Dict[str, Any],
+    perf_summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metrics = perf_history.perf_metrics_from_history(perf_payload)
+    summary = perf_summary or {}
+    return {
+        "winrate": metrics.get("winrate", summary.get("winrate")),
+        "total_pnl": metrics.get("total_pnl", summary.get("total_pnl")),
+        "drawdown": metrics.get("max_dd", summary.get("drawdown")),
+        "trades": metrics.get("trades", summary.get("trades")),
+    }
+
+
+def _append_ledger_entry(ledger_path: str, entry: Dict[str, Any]) -> None:
+    line = json.dumps(
+        entry,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    ledger_dir = os.path.dirname(ledger_path)
+    if ledger_dir:
+        os.makedirs(ledger_dir, exist_ok=True)
+    with open(ledger_path, "a", encoding="utf-8") as f:
+        f.write(line)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _build_ledger_entry(
+    result: promotion_gate.PromotionGateResult,
+    perf_payload: Dict[str, Any],
+    perf_path: str,
+    base_hash: str,
+    decision: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    replay_hash = result.replay_hash
+    if not replay_hash or replay_hash == "missing":
+        replay_payload = {k: v for k, v in perf_payload.items() if k != "timestamps"}
+        replay_hash = det.hash_json(replay_payload)
+    entry: Dict[str, Any] = {
+        "timestamp_utc": _utc_iso(),
+        "git_commit_hash": _git_commit_hash(),
+        "base_hash": base_hash or "missing",
+        "candidate_hash": result.candidate_hash,
+        "replay_hash": replay_hash,
+        "deterministic_hash": _deterministic_hash_from_perf_history(perf_payload),
+        "decision": decision,
+        "metrics": _ledger_metrics(perf_payload, _perf_summary_fields(result)),
+        "reason": reason if decision == "rejected" else "",
+        "perf_history_path": perf_path,
+    }
+    return entry
+
+
+def _archive_approved(approved_path: str, history_dir: str, stamp: str) -> str:
+    if not approved_path or not os.path.exists(approved_path):
+        raise RuntimeError(f"approved_missing path={approved_path}")
+    os.makedirs(history_dir, exist_ok=True)
+    archived_path = _unique_path(history_dir, os.path.basename(approved_path), stamp)
+    _atomic_copy_file(approved_path, archived_path)
+    return archived_path
+
+
+def _atomic_promote(
+    candidate_path: str,
+    approved_path: str,
+    history_dir: str,
+    stamp: str,
+) -> str:
+    archived_path = _archive_approved(approved_path, history_dir, stamp)
+    _atomic_replace_from_source(candidate_path, approved_path)
+    return archived_path
 
 
 def run(args: argparse.Namespace) -> int:
@@ -247,9 +440,40 @@ def run(args: argparse.Namespace) -> int:
 
     stamp = _timestamp()
     perf_summary = _perf_summary_fields(result)
+    base_hash = result.approved_hash if result is not None else "missing"
 
     if not result.ok:
         is_error = _is_processing_error_reason(result.reason)
+        if is_error:
+            _print_summary_line(
+                "FAIL",
+                result.reason,
+                result,
+                perf_summary,
+                perf_reason=perf_summary.get("perf_reason"),
+            )
+            return EXIT_ERROR
+
+        try:
+            perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
+            ledger_entry = _build_ledger_entry(
+                result=result,
+                perf_payload=perf_payload,
+                perf_path=perf_path,
+                base_hash=base_hash,
+                decision="rejected",
+                reason=result.reason,
+            )
+        except Exception as exc:
+            _print_summary_line(
+                "FAIL",
+                f"ledger_entry_failed {exc}",
+                result,
+                perf_summary,
+                perf_reason=perf_summary.get("perf_reason"),
+            )
+            return EXIT_ERROR
+
         rejected_path = ""
         try:
             rejected_path = _handle_rejection(candidate_path, args.rejected_dir, stamp)
@@ -263,17 +487,36 @@ def run(args: argparse.Namespace) -> int:
             )
             return EXIT_ERROR
 
-        reject_status = "FAIL" if is_error else "REJECT"
+        try:
+            _append_ledger_entry(args.ledger_path, ledger_entry)
+        except Exception as exc:
+            rollback_err = None
+            try:
+                if rejected_path and os.path.exists(rejected_path) and not os.path.exists(candidate_path):
+                    _move_file(rejected_path, candidate_path)
+            except Exception as rollback_exc:
+                rollback_err = rollback_exc
+            reason = f"ledger_write_failed {exc}"
+            if rollback_err is not None:
+                reason = f"{reason} rollback_failed={rollback_err}"
+            _print_summary_line(
+                "FAIL",
+                reason,
+                result,
+                perf_summary,
+                perf_reason=perf_summary.get("perf_reason"),
+            )
+            return EXIT_ERROR
+
         _print_summary_line(
-            reject_status,
+            "REJECT",
             result.reason,
             result,
             perf_summary,
             perf_reason=perf_summary.get("perf_reason"),
             rejected_path=rejected_path or "missing",
+            ledger_path=args.ledger_path,
         )
-        if is_error:
-            return EXIT_ERROR
         if no_exit_on_reject:
             return EXIT_OK
         return EXIT_REJECT
@@ -288,39 +531,78 @@ def run(args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
 
-    history_dir = args.history_dir
-    os.makedirs(history_dir, exist_ok=True)
-
-    archived_path = _unique_path(history_dir, os.path.basename(approved_path), stamp)
     try:
-        _move_file(approved_path, archived_path)
-        os.makedirs(os.path.dirname(approved_path), exist_ok=True)
-        _move_file(candidate_path, approved_path)
+        perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
+    except Exception as exc:
+        _print_summary_line(
+            "FAIL",
+            str(exc),
+            result=result,
+            perf_summary=perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+        )
+        return EXIT_ERROR
+
+    try:
+        archived_path = _atomic_promote(
+            candidate_path=candidate_path,
+            approved_path=approved_path,
+            history_dir=args.history_dir,
+            stamp=stamp,
+        )
+    except Exception as exc:
+        reason = f"atomic_replace_failed {exc}"
+        _print_summary_line(
+            "FAIL",
+            reason=reason,
+            result=result,
+            perf_summary=perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+        )
+        return EXIT_ERROR
+
+    try:
+        ledger_entry = _build_ledger_entry(
+            result=result,
+            perf_payload=perf_payload,
+            perf_path=perf_path,
+            base_hash=base_hash,
+            decision="approved",
+        )
+        _append_ledger_entry(args.ledger_path, ledger_entry)
     except Exception as exc:
         restore_err = None
-        if os.path.exists(archived_path) and not os.path.exists(approved_path):
-            try:
-                _move_file(archived_path, approved_path)
-            except Exception as restore_exc:
-                restore_err = restore_exc
-        reason = f"promotion_move_failed {exc}"
+        try:
+            _atomic_replace_from_source(archived_path, approved_path)
+        except Exception as restore_exc:
+            restore_err = restore_exc
+        reason = f"ledger_write_failed {exc}"
         if restore_err is not None:
             reason = f"{reason} restore_failed={restore_err}"
-        _print_summary_line("FAIL", reason=reason, result=result, perf_summary=perf_summary)
+        _print_summary_line(
+            "FAIL",
+            reason=reason,
+            result=result,
+            perf_summary=perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+        )
         return EXIT_ERROR
 
     manifest = {
-        "promoted_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "promoted_at": _utc_iso(),
         "reason": str(args.reason),
         "approved_hash": result.approved_hash,
         "candidate_hash": result.candidate_hash,
         "replay_hash": result.replay_hash,
+        "deterministic_hash": _deterministic_hash_from_perf_history(perf_payload),
         "performance_snapshot": result.performance_snapshot,
         "candidate_path": candidate_path,
         "approved_path": approved_path,
         "archived_path": archived_path,
+        "perf_history_path": perf_path,
+        "ledger_path": args.ledger_path,
     }
-    manifest_path = _unique_path(history_dir, "promotion_manifest.json", stamp)
+    manifest_path = _unique_path(args.history_dir, "promotion_manifest.json", stamp)
     _atomic_write_json(manifest_path, manifest)
 
     _print_summary_line(
@@ -331,6 +613,7 @@ def run(args: argparse.Namespace) -> int:
         perf_reason=perf_summary.get("perf_reason"),
         archived_path=archived_path,
         manifest_path=manifest_path,
+        ledger_path=args.ledger_path,
     )
     return EXIT_OK
 
