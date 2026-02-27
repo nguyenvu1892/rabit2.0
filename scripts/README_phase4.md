@@ -27,3 +27,16 @@ Rollback (TASK-4F):
   - `--dry_run 0`
 - Example dry-run:
   - `python -m scripts.meta_rollback --steps 1 --reason "task4f dryrun" --dry_run 1 --strict 1`
+
+Promotion Scheduling (TASK-4H):
+- Entrypoint: `python -m scripts.meta_schedule`
+- Supports run-once mode:
+  - `python -m scripts.meta_schedule --csv data/live/XAUUSD_M1_live.csv --run_once 1 --strict 0 --reason "task4h_run_once"`
+- Supports interval loop mode:
+  - `python -m scripts.meta_schedule --csv data/live/XAUUSD_M1_live.csv --interval_minutes 30 --max_runtime_seconds 7200 --reason "scheduled"`
+- Locking:
+  - Default lock path: `data/meta_states/.locks/meta_cycle.lock`
+  - `--run_once 1` returns exit code `3` if lock is fresh (`LOCKED`)
+  - Loop mode skips locked ticks and retries next interval
+- Audit log:
+  - Default JSONL: `data/reports/meta_schedule.jsonl`
