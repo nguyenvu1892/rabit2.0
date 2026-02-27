@@ -16,3 +16,14 @@ Saving behavior:
 
 Healthcheck:
 - `scripts.meta_healthcheck` continues to read the legacy path (`data/reports/meta_risk_state.json`) for now.
+
+Rollback (TASK-4F):
+- Entrypoint: `python -m scripts.meta_rollback`
+- Required: `--reason <string>`
+- Target selection: exactly one of `--to_hash <sha256>` or `--steps <int>` (unless `--dry_run 1` discovery-only mode)
+- Defaults:
+  - `--strict 1`
+  - `--ledger_path data/meta_states/ledger.jsonl`
+  - `--dry_run 0`
+- Example dry-run:
+  - `python -m scripts.meta_rollback --steps 1 --reason "task4f dryrun" --dry_run 1 --strict 1`
