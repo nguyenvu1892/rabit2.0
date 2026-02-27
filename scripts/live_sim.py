@@ -13,6 +13,7 @@ from rabit.rl.confidence_gate import make_default_gate
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.policy_linear import LinearPolicy
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
+from rabit.state import versioned_state as vstate
 
 from rabit.regime.regime_detector import RegimeDetector
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -269,24 +270,24 @@ def main(argv=None):
             min_trades_per_regime=args.meta_risk_min_trades,
         )
         meta_state = MetaRiskState(cfg)
-        if meta_persist and meta_state_in and os.path.exists(meta_state_in):
-            loaded = None
-            try:
-                loaded = MetaRiskState.load_json(cfg, meta_state_in)
-            except Exception as e:
-                print(f"[meta_risk] warn failed to load state from {meta_state_in}: {e}")
-                loaded = None
-            if loaded is not None:
-                meta_state = loaded
+        if meta_persist:
+            loaded_state, loaded_path, load_err = vstate.load_approved_state(
+                cfg,
+                base_dir=vstate.DEFAULT_BASE_DIR,
+                legacy_path=meta_state_in,
+                mirror_on_load=True,
+            )
+            if loaded_state is not None:
+                meta_state = loaded_state
                 meta_state.cfg = cfg
                 meta_state.daily_drawdown = 0.0
                 meta_state.daily_equity_peak = 0.0
                 meta_state.daily_date = None
                 meta_state.loss_streak = 0
                 meta_state.regime_freeze_until = {}
-                print(f"[meta_risk] loaded state from {meta_state_in}")
-            else:
-                print(f"[meta_risk] warn failed to load state from {meta_state_in}; using fresh state")
+                print(f"[meta_risk] loaded state from {loaded_path}")
+            elif load_err:
+                print(f"[meta_risk] warn failed to load state: {load_err}")
 
     # ===== Load + features =====
     loader = MT5DataLoader()
@@ -542,7 +543,11 @@ def main(argv=None):
     if meta_state is not None and meta_persist:
         saved = False
         try:
-            saved = meta_state.save_json(meta_state_out)
+            saved = vstate.save_approved_state(
+                meta_state,
+                base_dir=vstate.DEFAULT_BASE_DIR,
+                legacy_path=meta_state_out,
+            )
         except Exception as e:
             print(f"[meta_risk] warn failed to save state to {meta_state_out}: {e}")
             saved = False

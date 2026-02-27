@@ -26,6 +26,7 @@ from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighter
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 from rabit.rl.regime_perf_feedback import RegimePerfConfig, RegimePerfFeedbackEngine
 from rabit.rl.regime_ledger import RegimeLedgerConfig, RegimeLedgerState
+from rabit.state import versioned_state as vstate
 from rabit.env.trading_env import TradingEnv
 from rabit.env.session_filter import SessionFilter, SessionConfig
 from rabit.rl.regime_policy_bank import RegimePolicyBank
@@ -2420,12 +2421,30 @@ def _run_live_sim_daily_once(
     if int(args.meta_risk) == 1:
         mcfg = MetaRiskConfig()
         meta_state = MetaRiskState(mcfg)
-        if os.path.exists(args.meta_state_path):
-            try:
-                meta_state.load(args.meta_state_path)
-                print(f"[meta_risk] loaded state from {args.meta_state_path}")
-            except Exception as e:
-                print(f"[meta_risk] warn: cannot load state: {e}")
+        loaded_state, loaded_path, load_err = vstate.load_approved_state(
+            mcfg,
+            base_dir=vstate.DEFAULT_BASE_DIR,
+            legacy_path=args.meta_state_path,
+            mirror_on_load=True,
+        )
+        if loaded_state is not None:
+            meta_state = loaded_state
+            meta_state.cfg = mcfg
+            meta_state.daily_drawdown = 0.0
+            meta_state.daily_equity_peak = 0.0
+            meta_state.daily_date = None
+            meta_state.loss_streak = 0
+            meta_state.regime_freeze_until = {}
+            print(f"[meta_risk] loaded state from {loaded_path}")
+        elif load_err:
+            print(f"[meta_risk] warn: cannot load state: {load_err}")
+        if debug_enabled:
+            approved_path = vstate.approved_state_path(vstate.DEFAULT_BASE_DIR)
+            if os.path.exists(args.meta_state_path) and not os.path.exists(approved_path):
+                raise RuntimeError(
+                    "TASK-4A FAIL: approved meta state missing "
+                    f"(approved_path={approved_path})"
+                )
         if read_only_state:
             meta_state.read_only = True
 
@@ -2778,6 +2797,13 @@ def _run_live_sim_daily_once(
             if perf_engine.save(perf_state_path):
                 if debug_enabled:
                     print(f"[regime_perf] saved state to {perf_state_path}")
+        if meta_state is not None and not read_only_state:
+            vstate.save_approved_state(
+                meta_state,
+                base_dir=vstate.DEFAULT_BASE_DIR,
+                legacy_path=args.meta_state_path,
+                debug=debug_enabled,
+            )
 
     if mt5_export:
         trades_export_df = pd.DataFrame()

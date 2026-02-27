@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from typing import Any, Dict, List, Optional, Tuple
+
+DEFAULT_BASE_DIR = os.path.join("data", "meta_states")
+DEFAULT_STATE_FILE = "meta_risk_state.json"
+
+
+def ensure_state_dirs(base_dir: str = DEFAULT_BASE_DIR) -> Dict[str, str]:
+    paths = {
+        "base": base_dir,
+        "current_approved": os.path.join(base_dir, "current_approved"),
+        "candidate": os.path.join(base_dir, "candidate"),
+        "rejected": os.path.join(base_dir, "rejected"),
+        "history": os.path.join(base_dir, "history"),
+    }
+    for path in paths.values():
+        os.makedirs(path, exist_ok=True)
+    return paths
+
+
+def approved_state_path(base_dir: str = DEFAULT_BASE_DIR, filename: str = DEFAULT_STATE_FILE) -> str:
+    return os.path.join(base_dir, "current_approved", filename)
+
+
+def history_dir(base_dir: str = DEFAULT_BASE_DIR) -> str:
+    return os.path.join(base_dir, "history")
+
+
+def list_versions(base_dir: str = DEFAULT_BASE_DIR) -> List[str]:
+    hist = history_dir(base_dir)
+    if not os.path.exists(hist):
+        return []
+    try:
+        entries = [name for name in os.listdir(hist) if name and not name.startswith(".")]
+    except Exception:
+        return []
+    return sorted(entries)
+
+
+def legacy_state_path() -> str:
+    return os.path.join("data", "reports", DEFAULT_STATE_FILE)
+
+
+def _stable_json_text(data: Any) -> str:
+    return json.dumps(
+        data,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    dir_path = os.path.dirname(path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=dir_path or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _atomic_write_json(path: str, data: Any) -> bool:
+    try:
+        payload = _stable_json_text(data)
+        _atomic_write_text(path, payload)
+        return True
+    except Exception:
+        return False
+
+
+def load_approved_state(
+    cfg: Any,
+    base_dir: str = DEFAULT_BASE_DIR,
+    legacy_path: Optional[str] = None,
+    mirror_on_load: bool = True,
+) -> Tuple[Optional[Any], str, Optional[str]]:
+    from rabit.rl.meta_risk import MetaRiskState
+
+    ensure_state_dirs(base_dir)
+    approved_path = approved_state_path(base_dir)
+    legacy_path = legacy_path or legacy_state_path()
+
+    load_errors: List[str] = []
+    if approved_path and os.path.exists(approved_path):
+        try:
+            state = MetaRiskState.load_json(cfg, approved_path)
+            if state is not None:
+                return state, approved_path, None
+            load_errors.append("approved_state_invalid")
+        except Exception as exc:
+            load_errors.append(f"approved_state_error={exc}")
+
+    if legacy_path and os.path.exists(legacy_path):
+        try:
+            state = MetaRiskState.load_json(cfg, legacy_path)
+            if state is not None:
+                if mirror_on_load:
+                    _atomic_write_json(approved_path, state.to_dict())
+                return state, legacy_path, None
+            load_errors.append("legacy_state_invalid")
+        except Exception as exc:
+            load_errors.append(f"legacy_state_error={exc}")
+
+    if load_errors:
+        return None, "", "; ".join(load_errors)
+    return None, "", None
+
+
+def save_approved_state(
+    state: Any,
+    base_dir: str = DEFAULT_BASE_DIR,
+    legacy_path: Optional[str] = None,
+    debug: bool = False,
+) -> bool:
+    if state is None:
+        return False
+    if getattr(state, "read_only", False):
+        return False
+
+    ensure_state_dirs(base_dir)
+    approved_path = approved_state_path(base_dir)
+    legacy_path = legacy_path or legacy_state_path()
+    payload = state.to_dict() if hasattr(state, "to_dict") else state
+
+    legacy_ok = _atomic_write_json(legacy_path, payload)
+    if legacy_ok:
+        _atomic_write_json(approved_path, payload)
+
+    if debug and legacy_ok and not os.path.exists(approved_path):
+        raise RuntimeError(
+            "TASK-4A FAIL: approved meta state missing after save "
+            f"(approved_path={approved_path})"
+        )
+
+    return legacy_ok

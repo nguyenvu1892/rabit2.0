@@ -19,6 +19,7 @@ from rabit.rl.policy_linear import LinearPolicy
 from rabit.rl.regime_policy_bank import RegimePolicyBank
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 from rabit.regime.regime_detector import RegimeDetector
+from rabit.state import versioned_state as vstate
 
 from rabit.env.execution_model import ExecutionModel, ExecutionConfig
 from rabit.env.session_filter import SessionFilter, SessionConfig
@@ -380,19 +381,19 @@ def main():
     if cfg.meta_risk_enabled:
         meta_cfg = MetaRiskConfig()
         meta_state = MetaRiskState(meta_cfg)
-        if meta_persist and meta_state_in and os.path.exists(meta_state_in):
-            loaded = None
-            try:
-                loaded = MetaRiskState.load_json(meta_cfg, meta_state_in)
-            except Exception as e:
-                print(f"[meta_risk] warn failed to load state from {meta_state_in}: {e}")
-                loaded = None
-            if loaded is not None:
-                meta_state = loaded
+        if meta_persist:
+            loaded_state, loaded_path, load_err = vstate.load_approved_state(
+                meta_cfg,
+                base_dir=vstate.DEFAULT_BASE_DIR,
+                legacy_path=meta_state_in,
+                mirror_on_load=True,
+            )
+            if loaded_state is not None:
+                meta_state = loaded_state
                 meta_state.cfg = meta_cfg
-                print(f"[meta_risk] loaded state from {meta_state_in}")
-            else:
-                print(f"[meta_risk] warn failed to load state from {meta_state_in}; using fresh state")
+                print(f"[meta_risk] loaded state from {loaded_path}")
+            elif load_err:
+                print(f"[meta_risk] warn failed to load state: {load_err}")
     meta_save_counter = 0
 
     append_jsonl(out_jsonl, {"event": "START", "live_csv": cfg.live_csv, "ts": str(pd.Timestamp.now(tz="UTC"))})
@@ -633,7 +634,11 @@ def main():
                 if cfg.meta_risk_save_every > 0 and meta_save_counter >= cfg.meta_risk_save_every:
                     saved = False
                     try:
-                        saved = meta_state.save_json(meta_state_out)
+                        saved = vstate.save_approved_state(
+                            meta_state,
+                            base_dir=vstate.DEFAULT_BASE_DIR,
+                            legacy_path=meta_state_out,
+                        )
                     except Exception as e:
                         print(f"[meta_risk] warn failed to save state to {meta_state_out}: {e}")
                         saved = False
