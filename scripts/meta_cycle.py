@@ -21,6 +21,8 @@ from rabit.state.anomaly_guardrail import detect_anomaly
 from rabit.state.exit_codes import ExitCode
 from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
 from rabit.utils import StructuredLogger, generate_cycle_id, get_logger
+from scripts.mutation_regime import apply_intensity_to_mutation_cfg, compute_regime_mutation_intensity
+from scripts.regime_utils import load_live_regime_report, pick_current_regime, summarize_regime_perf_from_ledger
 
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
@@ -33,6 +35,7 @@ DEFAULT_CANDIDATE_PATH = os.path.join("data", "meta_states", "candidate", "meta_
 DEFAULT_CANDIDATE_MANIFEST = os.path.join("data", "meta_states", "candidate", "manifest.json")
 DEFAULT_SHADOW_REPORT = os.path.join("data", "reports", "shadow_replay_report.json")
 DEFAULT_LEDGER_PATH = os.path.join("data", "meta_states", "ledger.jsonl")
+DEFAULT_REGIME_REPORT_PATH = os.path.join("data", "reports", "live_daily_regime.json")
 DEFAULT_HEALTH_OUT_DIR = os.path.join("data", "reports", "meta_cycle_healthcheck")
 DEFAULT_INCIDENT_DIR = os.path.join("data", "reports", "incidents")
 DEFAULT_LOCK_PATH = os.path.join("data", "meta_states", ".locks", "meta_cycle.lock")
@@ -46,6 +49,8 @@ _HEALTHCHECK_STATUS_RE = re.compile(r"\[healthcheck\]\s+STATUS=(PASS|FAIL)")
 _MUTATION_K_MIN = 3
 _MUTATION_K_MAX = 5
 _MUTATION_K_DEFAULT = 5
+_MUTATION_REGEN_ATTEMPTS_DEFAULT = 4
+_MUTATION_LOOKBACK_DAYS_DEFAULT = 30
 
 
 @dataclass
@@ -229,6 +234,24 @@ def _parse_args() -> argparse.Namespace:
         "--mutation_profile",
         default="safe",
         help='Mutation profile (currently only "safe" is implemented).',
+    )
+    ap.add_argument(
+        "--regime_aware_mutation",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Scale mutation search knobs by current regime/perf context (0/1).",
+    )
+    ap.add_argument(
+        "--regime_report_path",
+        default=DEFAULT_REGIME_REPORT_PATH,
+        help=f"Path to live regime report JSON (default: {DEFAULT_REGIME_REPORT_PATH}).",
+    )
+    ap.add_argument(
+        "--mutation_lookback_days",
+        type=int,
+        default=_MUTATION_LOOKBACK_DAYS_DEFAULT,
+        help=f"Lookback days for ledger-based regime perf summary (default: {_MUTATION_LOOKBACK_DAYS_DEFAULT}).",
     )
     ap.add_argument("--cycle_id", default="", help="Optional correlation id propagated across cycle stages")
     return ap.parse_args()
@@ -481,6 +504,62 @@ def _clamp_k_candidates(raw_value: Any) -> int:
     return int(out)
 
 
+def _safe_int_or_default(value: Any, default: int) -> int:
+    try:
+        if isinstance(value, bool):
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _build_base_mutation_knobs(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "k_candidates": int(_clamp_k_candidates(getattr(args, "k_candidates", _MUTATION_K_DEFAULT))),
+        "k_candidates_min": int(_MUTATION_K_MIN),
+        "k_candidates_max": int(_MUTATION_K_MAX),
+        "candidate_regen_max_attempts": int(_MUTATION_REGEN_ATTEMPTS_DEFAULT),
+        "candidate_regen_max_attempts_min": 1,
+        "candidate_regen_max_attempts_max": 8,
+        "scalable_keys": ["k_candidates", "candidate_regen_max_attempts"],
+    }
+
+
+def _active_mutation_knobs(knobs_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(knobs_cfg or {})
+    return {
+        "k_candidates": int(_clamp_k_candidates(cfg.get("k_candidates", _MUTATION_K_DEFAULT))),
+        "candidate_regen_max_attempts": int(
+            max(1, _safe_int_or_default(cfg.get("candidate_regen_max_attempts"), _MUTATION_REGEN_ATTEMPTS_DEFAULT))
+        ),
+    }
+
+
+def _extract_regime_perf_score(regime_perf: Dict[str, Any], regime: str) -> Optional[float]:
+    if not isinstance(regime_perf, dict):
+        return None
+    regime_key = str(regime or "unknown").strip().lower() or "unknown"
+    per_regime = regime_perf.get("per_regime")
+    if isinstance(per_regime, dict):
+        if regime_key in per_regime and isinstance(per_regime[regime_key], dict):
+            score = _safe_float_or_none(per_regime[regime_key].get("perf_score"))
+            if score is not None:
+                return float(score)
+        for key, payload in per_regime.items():
+            if str(key).strip().lower() != regime_key or not isinstance(payload, dict):
+                continue
+            score = _safe_float_or_none(payload.get("perf_score"))
+            if score is not None:
+                return float(score)
+        global_payload = regime_perf.get("global")
+        if isinstance(global_payload, dict):
+            return _safe_float_or_none(global_payload.get("perf_score"))
+    global_payload = regime_perf.get("global")
+    if isinstance(global_payload, dict):
+        return _safe_float_or_none(global_payload.get("perf_score"))
+    return _safe_float_or_none(regime_perf.get("perf_score"))
+
+
 def _resolve_mutation_seed(
     *,
     approved_hash: str,
@@ -525,12 +604,15 @@ def _run_mutation_selection(
     logger: StructuredLogger,
     cycle_id: str,
     approved_hash: str,
+    mutation_cfg: Optional[Dict[str, Any]] = None,
 ) -> MutationSelection:
     profile = str(getattr(args, "mutation_profile", "safe") or "safe").strip().lower()
     if profile != "safe":
         raise RuntimeError(f"unsupported_mutation_profile profile={profile}")
 
-    k_candidates = _clamp_k_candidates(getattr(args, "k_candidates", _MUTATION_K_DEFAULT))
+    knobs = _active_mutation_knobs(dict(mutation_cfg or {}))
+    k_candidates = int(knobs["k_candidates"])
+    regen_attempt_limit = int(knobs["candidate_regen_max_attempts"])
     seed, seed_basis = _resolve_mutation_seed(
         approved_hash=str(approved_hash),
         reason=str(args.reason),
@@ -545,7 +627,9 @@ def _run_mutation_selection(
 
     _log(
         "mutation_config "
-        f"enabled=1 k_candidates={k_candidates} mutation_seed={seed} mutation_profile={profile}"
+        f"enabled=1 k_candidates={k_candidates} "
+        f"candidate_regen_max_attempts={regen_attempt_limit} "
+        f"mutation_seed={seed} mutation_profile={profile}"
     )
     logger.info(
         event="mutation_candidates_generated",
@@ -604,7 +688,7 @@ def _run_mutation_selection(
                 raise RuntimeError(f"mutation_candidate_generate_failed index={idx} rc={step.return_code}")
             candidate_hash = _load_candidate_hash(candidate_manifest, candidate_path)
             param_diff_summary = _manifest_param_diff_summary(candidate_manifest)
-            if idx == 0 or candidate_hash not in seen_candidate_hashes or attempts >= 4:
+            if idx == 0 or candidate_hash not in seen_candidate_hashes or attempts >= regen_attempt_limit:
                 break
             attempts += 1
             _log(
@@ -824,6 +908,7 @@ def _run_mutation_selection(
         "mutation_seed": int(seed),
         "mutation_seed_basis": seed_basis,
         "mutation_profile": profile,
+        "mutation_knobs": knobs,
         "candidates": ledger_candidates,
         "selected_candidate_hash": selected_hash,
         "selection_reason": selection_reason,
@@ -948,6 +1033,8 @@ def _run_cycle(
     skip_replay = int(args.skip_replay) == 1
     skip_promote = int(args.skip_promote) == 1
     opt_mutation = int(getattr(args, "opt_mutation", 0)) == 1
+    regime_aware_mutation = int(getattr(args, "regime_aware_mutation", 0)) == 1
+    mutation_knobs_cfg = _build_base_mutation_knobs(args)
 
     t_total = time.perf_counter()
     candidate_hash = "missing"
@@ -980,6 +1067,53 @@ def _run_cycle(
             opt_mutation = False
 
         if opt_mutation:
+            if regime_aware_mutation:
+                regime_report_path = str(
+                    getattr(args, "regime_report_path", DEFAULT_REGIME_REPORT_PATH) or DEFAULT_REGIME_REPORT_PATH
+                ).strip()
+                perf_ledger_path = paths.promote_ledger_path
+                if not perf_ledger_path or not os.path.exists(perf_ledger_path):
+                    perf_ledger_path = DEFAULT_LEDGER_PATH
+                lookback_days = max(
+                    0,
+                    _safe_int_or_default(
+                        getattr(args, "mutation_lookback_days", _MUTATION_LOOKBACK_DAYS_DEFAULT),
+                        _MUTATION_LOOKBACK_DAYS_DEFAULT,
+                    ),
+                )
+                regime_report = load_live_regime_report(regime_report_path)
+                regime, conf = pick_current_regime(regime_report)
+                regime_perf = summarize_regime_perf_from_ledger(perf_ledger_path, lookback_days)
+                intensity = compute_regime_mutation_intensity(
+                    regime=str(regime),
+                    regime_perf=regime_perf,
+                    conf=float(conf),
+                    cfg={
+                        "base_intensity": 1.0,
+                        "min_intensity": 0.75,
+                        "max_intensity": 1.35,
+                        "perf_weight": 0.85,
+                        "confidence_floor": 0.25,
+                    },
+                )
+                mutation_knobs_cfg = apply_intensity_to_mutation_cfg(mutation_knobs_cfg, intensity)
+                effective_knobs = _active_mutation_knobs(mutation_knobs_cfg)
+                perf_score = _extract_regime_perf_score(regime_perf, str(regime))
+                logger.info(
+                    event="regime_mutation_intensity",
+                    stage="candidate_generate",
+                    cycle_id=cycle_id,
+                    regime=str(regime),
+                    conf=round(float(conf), 8),
+                    perf=_round8_or_none(perf_score),
+                    intensity=round(float(intensity), 8),
+                    knobs=effective_knobs,
+                )
+                _log(
+                    "regime_mutation_intensity "
+                    f"regime={regime} conf={round(float(conf), 8)} perf={_round8_or_none(perf_score)} "
+                    f"intensity={round(float(intensity), 8)} knobs={effective_knobs}"
+                )
             approved_hash = _sha256_file(paths.approved_state_path)
             mutation_selection = _run_mutation_selection(
                 args=args,
@@ -988,6 +1122,7 @@ def _run_cycle(
                 logger=logger,
                 cycle_id=cycle_id,
                 approved_hash=approved_hash,
+                mutation_cfg=mutation_knobs_cfg,
             )
             if not mutation_selection.candidates:
                 cycle_status = "FAIL"
@@ -1450,6 +1585,17 @@ def main() -> int:
         k_candidates=int(_clamp_k_candidates(getattr(args, "k_candidates", _MUTATION_K_DEFAULT))),
         mutation_profile=str(getattr(args, "mutation_profile", "safe")),
         mutation_seed=str(getattr(args, "mutation_seed", "") or ""),
+        regime_aware_mutation=int(getattr(args, "regime_aware_mutation", 0)),
+        regime_report_path=str(getattr(args, "regime_report_path", DEFAULT_REGIME_REPORT_PATH)),
+        mutation_lookback_days=int(
+            max(
+                0,
+                _safe_int_or_default(
+                    getattr(args, "mutation_lookback_days", _MUTATION_LOOKBACK_DAYS_DEFAULT),
+                    _MUTATION_LOOKBACK_DAYS_DEFAULT,
+                ),
+            )
+        ),
     )
     dry_run = int(args.dry_run) == 1
     skip_global_lock = int(args.skip_global_lock) == 1
