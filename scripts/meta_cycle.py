@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import shlex
@@ -15,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
+from rabit.state import atomic_io
 from rabit.state.exit_codes import ExitCode
 from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
 
@@ -201,8 +201,7 @@ def _is_sha256(text: Optional[str]) -> bool:
 def _load_candidate_hash(candidate_manifest_path: str, candidate_path: str) -> str:
     if os.path.exists(candidate_manifest_path):
         try:
-            with open(candidate_manifest_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
+            payload, _ = atomic_io.load_json_with_fallback(candidate_manifest_path)
             if isinstance(payload, dict):
                 candidate_sha = str(payload.get("candidate_sha256", "")).strip().lower()
                 if _is_sha256(candidate_sha):

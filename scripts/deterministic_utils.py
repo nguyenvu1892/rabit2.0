@@ -5,6 +5,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Set
 
+from rabit.state import atomic_io
+
 
 def _json_default(value: Any) -> str:
     return str(value)
@@ -44,8 +46,7 @@ def load_json(path: str) -> Optional[Dict[str, Any]]:
     if not path or not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data, _ = atomic_io.load_json_with_fallback(path)
         if isinstance(data, dict):
             return data
     except Exception:
@@ -54,8 +55,13 @@ def load_json(path: str) -> Optional[Dict[str, Any]]:
 
 
 def save_json(path: str, data: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    atomic_io.atomic_write_json(
+        path,
+        data,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 
 def _strip_keys(data: Any, ignore_keys: Optional[Set[str]]) -> Any:

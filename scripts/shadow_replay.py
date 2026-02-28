@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts import _deterministic as detx
 from scripts import deterministic_utils as det
 from scripts import live_sim_daily as live
-from scripts import _io_utils as io_utils
 from rabit.rl.confidence_weighting import ConfidenceWeighter, ConfidenceWeighterConfig
 from rabit.rl.meta_risk import MetaRiskConfig, MetaRiskState
 from rabit.rl.regime_perf_feedback import RegimePerfConfig, RegimePerfFeedbackEngine
 from rabit.meta import perf_history
+from rabit.state import atomic_io
 from rabit.state import versioned_state as vstate
 
 
@@ -103,8 +102,12 @@ def _load_meta_state(
             meta_state.regime_freeze_until = {}
             if debug_enabled:
                 print(f"[meta_risk] loaded state from {loaded_path}")
-        elif load_err and debug_enabled:
-            print(f"[meta_risk] warn: cannot load state: {load_err}")
+        elif load_err:
+            strict_enabled = _parse_bool_flag(getattr(args, "strict", 1), default=True)
+            if strict_enabled:
+                raise RuntimeError(f"meta_state_load_failed {load_err}")
+            if debug_enabled:
+                print(f"[meta_risk] warn: cannot load state: {load_err}")
         meta_state.read_only = True
         if loaded_path is None:
             loaded_path = args.meta_state_path
@@ -562,11 +565,13 @@ def _run_shadow_replay_once(
 
 
 def _write_report(path: str, report: Dict[str, Any]) -> None:
-    out_dir = os.path.dirname(path)
-    if out_dir:
-        io_utils.ensure_dir(out_dir)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    atomic_io.atomic_write_json(
+        path,
+        report,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 
 def main() -> None:

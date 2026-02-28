@@ -40,3 +40,14 @@ Promotion Scheduling (TASK-4H):
   - Loop mode skips locked ticks and retries next interval
 - Audit log:
   - Default JSONL: `data/reports/meta_schedule.jsonl`
+
+State/Ledger Atomicity (PH4-H3):
+- Critical JSON writes now use atomic replace (`write temp -> fsync -> os.replace`) and keep a rolling `.bak` sibling for decode fallback.
+- Covered files include:
+  - `data/meta_states/**/meta_risk_state.json`
+  - `data/meta_states/**/manifest.json`
+  - `data/meta_states/**/perf_history.json`
+  - `data/reports/shadow_replay_report.json` and healthcheck JSON outputs generated via `live_sim_daily`.
+- `data/meta_states/ledger.jsonl` appends now use crash-safe JSONL append with `fsync`.
+- On next append, a trailing partial/invalid tail line is auto-truncated to the last valid newline/JSON boundary.
+- Ledger readers in scheduling/rollback paths ignore only invalid trailing tail lines and still fail on non-trailing corruption.

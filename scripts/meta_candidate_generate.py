@@ -4,12 +4,11 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
-import json
 import os
 import random
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from rabit.state import atomic_io
 from scripts import deterministic_utils as det
@@ -63,7 +62,7 @@ def _print_status(status: str, **kwargs: Any) -> None:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    atomic_io.atomic_write_text(path, text, suffix=".json")
+    atomic_io.atomic_write_text(path, text, suffix=".json", create_backup=True)
 
 
 def _atomic_write_json(path: str, payload: Any) -> None:
@@ -76,12 +75,11 @@ def _atomic_write_json(path: str, payload: Any) -> None:
     )
 
 
-def _load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def _load_json(path: str) -> Tuple[Dict[str, Any], str]:
+    data, loaded_from = atomic_io.load_json_with_fallback(path)
     if not isinstance(data, dict):
         raise RuntimeError(f"approved_state_invalid type={type(data).__name__}")
-    return data
+    return data, loaded_from
 
 
 def _perturb(value: float, key: str, rng: random.Random) -> float:
@@ -168,12 +166,11 @@ def run(args: argparse.Namespace) -> int:
 
     _ensure_distinct_paths(approved_path, candidate_out_path)
 
-    approved_raw: str
-    with open(approved_path, "r", encoding="utf-8") as f:
+    approved_data, approved_loaded_from = _load_json(approved_path)
+    with open(approved_loaded_from, "r", encoding="utf-8") as f:
         approved_raw = f.read()
-    approved_data = _load_json(approved_path)
 
-    source_sha256 = det.sha256_file(approved_path)
+    source_sha256 = det.sha256_file(approved_loaded_from)
 
     if debug:
         print(f"[candidate_gen] debug mode={mode} source_sha256={source_sha256}")

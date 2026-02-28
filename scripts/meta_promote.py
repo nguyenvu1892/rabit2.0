@@ -170,7 +170,12 @@ def _utc_iso() -> str:
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    atomic_io.atomic_write_text(path, det.stable_json_dumps(payload), suffix=".json")
+    atomic_io.atomic_write_text(
+        path,
+        det.stable_json_dumps(payload),
+        suffix=".json",
+        create_backup=True,
+    )
 
 
 def _atomic_copy_file(src: str, dest: str) -> None:
@@ -339,12 +344,11 @@ def _ledger_metrics(
 
 
 def _append_ledger_entry(ledger_path: str, entry: Dict[str, Any]) -> None:
-    atomic_io.append_jsonl_record(
+    atomic_io.safe_append_jsonl(
         ledger_path,
         entry,
         ensure_ascii=False,
         sort_keys=True,
-        separators=(",", ":"),
     )
 
 

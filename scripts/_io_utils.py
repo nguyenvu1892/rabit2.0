@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from rabit.state import atomic_io
 
 
 def ensure_dir(path: str) -> None:
@@ -18,8 +18,13 @@ def safe_write_json(
     indent: int = 2,
     sort_keys: bool = False,
 ) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=ensure_ascii, indent=indent, sort_keys=sort_keys)
+    atomic_io.atomic_write_json(
+        path,
+        payload,
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        sort_keys=sort_keys,
+    )
 
 
 def _debug_print(enabled: bool, msg: str) -> None:

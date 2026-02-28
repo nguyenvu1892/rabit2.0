@@ -2,17 +2,16 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
+from rabit.state import atomic_io
 
 
 def _load_json(path: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data, _ = atomic_io.load_json_with_fallback(path)
         if not isinstance(data, dict):
             return False, None
         return True, data

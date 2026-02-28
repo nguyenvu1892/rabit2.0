@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, Optional, Tuple
 import datetime
 
+from rabit.state import atomic_io
+
 _NONZERO_EPS = 1e-6
 
 
@@ -994,13 +996,17 @@ class MetaRiskState:
         if getattr(self, "read_only", False):
             return
         data = self.to_dict()
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
+        atomic_io.atomic_write_json(
+            path,
+            data,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
 
     @classmethod
     def load(cls, path: str) -> "MetaRiskState":
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data, _ = atomic_io.load_json_with_fallback(path)
         return cls.from_dict(None, data)
 
     def save_json(self, path: str) -> bool:
@@ -1020,11 +1026,13 @@ def save_json(path: str, state: MetaRiskState) -> bool:
         return False
 
     try:
-        dir_path = os.path.dirname(path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state.to_dict(), f, indent=2, sort_keys=True)
+        atomic_io.atomic_write_json(
+            path,
+            state.to_dict(),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
         return True
     except Exception:
         return False
@@ -1043,8 +1051,7 @@ def load_json(cfg_or_path: Optional[MetaRiskConfig], path: Optional[str] = None)
         return None
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data, _ = atomic_io.load_json_with_fallback(path)
         return MetaRiskState.from_dict(cfg, data)
     except Exception:
         return None

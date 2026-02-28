@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import os
 import re
 import sys
@@ -142,12 +141,11 @@ def _atomic_replace_from_source(src: str, dest: str) -> None:
 
 
 def _append_ledger_entry(ledger_path: str, entry: Dict[str, Any]) -> None:
-    atomic_io.append_jsonl_record(
+    atomic_io.safe_append_jsonl(
         ledger_path,
         entry,
         ensure_ascii=False,
         sort_keys=True,
-        separators=(",", ":"),
     )
 
 
@@ -156,19 +154,17 @@ def _load_ledger_events(ledger_path: str) -> List[Dict[str, Any]]:
         raise RollbackInternalError(f"ledger_missing path={ledger_path}")
 
     events: List[Dict[str, Any]] = []
-    with open(ledger_path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            raw = line.strip()
-            if not raw:
-                continue
-            try:
-                payload = json.loads(raw)
-            except Exception as exc:
-                raise RollbackInternalError(f"ledger_parse_error line={line_no} error={exc}") from exc
-            if not isinstance(payload, dict):
-                raise RollbackInternalError(f"ledger_parse_error line={line_no} reason=non_object_json")
-            payload["_line_no"] = int(line_no)
-            events.append(payload)
+    try:
+        rows, skipped = atomic_io.read_jsonl_best_effort(ledger_path, return_skipped=True)
+    except Exception as exc:
+        raise RollbackInternalError(f"ledger_parse_error path={ledger_path} error={exc}") from exc
+    for line_no, payload in enumerate(rows, start=1):
+        if not isinstance(payload, dict):
+            raise RollbackInternalError(f"ledger_parse_error line={line_no} reason=non_object_json")
+        payload["_line_no"] = int(line_no)
+        events.append(payload)
+    if skipped > 0:
+        _print_status("WARN", reason=f"ledger_tail_recovered path={ledger_path} skipped={int(skipped)}")
     return events
 
 

@@ -72,7 +72,7 @@ def _stable_json_text(data: Any) -> str:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    atomic_io.atomic_write_text(path, text, suffix=".json")
+    atomic_io.atomic_write_text(path, text, suffix=".json", create_backup=True)
 
 
 def _atomic_write_json(path: str, data: Any) -> bool:

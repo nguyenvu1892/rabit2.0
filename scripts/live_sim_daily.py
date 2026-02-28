@@ -1207,13 +1207,11 @@ def write_equity_csv(path: str, equity_rows: List[Dict[str, Any]]) -> None:
 
 
 def write_summary_json(path: str, summary: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    io_utils.safe_write_json(path, summary, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def write_regime_json(path: str, regime_stats: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(regime_stats, f, ensure_ascii=False, indent=2)
+    io_utils.safe_write_json(path, regime_stats, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def _aggregate_regime_counts(regime_stats: Dict[str, Any]) -> Dict[str, int]:

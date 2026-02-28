@@ -233,7 +233,12 @@ def load_perf_history(path: str) -> Optional[Dict[str, Any]]:
 
 
 def write_perf_history(path: str, payload: Dict[str, Any]) -> None:
-    atomic_io.atomic_write_text(path, det.stable_json_dumps(payload), suffix=".json")
+    atomic_io.atomic_write_text(
+        path,
+        det.stable_json_dumps(payload),
+        suffix=".json",
+        create_backup=True,
+    )
 
 
 def validate_perf_history(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:

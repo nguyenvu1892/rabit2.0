@@ -11,7 +11,6 @@ Usage examples:
 
 import argparse
 import datetime as dt
-import json
 import os
 import re
 import shlex
@@ -21,6 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from rabit.state import atomic_io
 from rabit.state.exit_codes import ExitCode
 from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
 
@@ -64,10 +64,6 @@ def _log(message: str) -> None:
 
 def _lock_log(message: str) -> None:
     print(f"[lock] {message}")
-
-
-def _json_dumps(payload: Dict[str, Any]) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -221,11 +217,12 @@ def _load_last_ledger_entry(ledger_path: str) -> Dict[str, Any]:
     if not ledger_path or not os.path.exists(ledger_path):
         return {}
     try:
-        with open(ledger_path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
-        if not lines:
+        rows, skipped = atomic_io.read_jsonl_best_effort(ledger_path, return_skipped=True)
+        if skipped > 0:
+            _log(f"ledger_tail_recovered path={ledger_path} skipped={int(skipped)}")
+        if not rows:
             return {}
-        payload = json.loads(lines[-1])
+        payload = rows[-1]
         if isinstance(payload, dict):
             return payload
     except Exception:
@@ -332,15 +329,7 @@ def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecRes
 
 
 def _append_audit_record(path: str, record: Dict[str, Any]) -> None:
-    out_dir = os.path.dirname(path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    line = _json_dumps(record)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
+    atomic_io.safe_append_jsonl(path, record, ensure_ascii=False, sort_keys=True)
 
 
 def _build_audit_record(

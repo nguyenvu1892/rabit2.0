@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from scripts import deterministic_utils as det
 from rabit.meta import perf_history
+from rabit.state import atomic_io
 
 DEFAULT_PERF_DAYS = 30
 DEFAULT_MIN_WINRATE = 0.25
@@ -451,7 +452,18 @@ def evaluate_candidate(
     candidate_hash = det.sha256_file(candidate_path)
     approved_hash = det.sha256_file(approved_path) if approved_path else "missing"
 
-    candidate_data = det.load_json(candidate_path)
+    try:
+        candidate_data, _ = atomic_io.load_json_with_fallback(candidate_path)
+    except Exception as exc:
+        return PromotionGateResult(
+            ok=False,
+            reason=f"candidate_json_invalid path={candidate_path} error={exc}",
+            candidate_hash=candidate_hash,
+            approved_hash=approved_hash,
+            replay_hash="missing",
+            performance_snapshot={},
+            details=details,
+        )
     if not isinstance(candidate_data, dict):
         return PromotionGateResult(
             ok=False,

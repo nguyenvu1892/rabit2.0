@@ -1,0 +1,600 @@
+{
+  "bars_loaded": 100001,
+  "counts": {
+    "decisions_total": 100001,
+    "holds": 83285,
+    "long": 9044,
+    "short": 7672,
+    "trades_simulated": 5631
+  },
+  "determinism": {
+    "equity_hash": "69cb576dd644f0b1611f5bd32b5cb904f0d52a2cfc0a23ac2e99bde6d243dfb6",
+    "input_hash": "32f5d4657afeb1b88f1b938ee5e9437246eb88892904fbb4d320dcde517234ed",
+    "regime_ledger_hash": "d4dfac64b37770c0e699d5df5ee9a3e346245335d5a133171b9d24ad0ec3c2c5"
+  },
+  "end_ts": "2026-02-11T16:23:00",
+  "feature_source": "TradingEnv",
+  "guardrails": {
+    "bars_after_session_filter": 61175,
+    "bars_after_spread_filter": 60982,
+    "bars_after_time_parse": 100001,
+    "bars_total": 100001,
+    "final_allowed": 16716,
+    "guardrail_reject": 0,
+    "policy_hold": 71707,
+    "session_reject": 11386,
+    "signals_after_guardrails": 28294,
+    "signals_total": 28294,
+    "size_zero": 0,
+    "spread_open_reject": 192,
+    "spread_spike_reject": 0
+  },
+  "input_csv": "data/live/XAUUSD_M1_live.csv",
+  "meta_state_path": "data\\meta_states\\candidate\\meta_risk_state.json",
+  "meta_state_sha256": "d21968ab23ecad2b9cdebe08cd722aa6f5ac638905b6f34c3d28c64db146d0f8",
+  "model_mode": "regime_bank",
+  "n_features": 14,
+  "perf_daily": [
+    {
+      "day": "2025-10-29",
+      "day_pnl": -0.10342248654222885,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9348267690389207
+    },
+    {
+      "day": "2025-10-30",
+      "day_pnl": -2.5387105838445336,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.6424577078101947
+    },
+    {
+      "day": "2025-10-31",
+      "day_pnl": -1.8476363569600949,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.1872707503820834
+    },
+    {
+      "day": "2025-11-02",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-11-03",
+      "day_pnl": -0.2021122230235619,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.0360993837813908
+    },
+    {
+      "day": "2025-11-04",
+      "day_pnl": -0.10667776658493722,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.492546077274426
+    },
+    {
+      "day": "2025-11-05",
+      "day_pnl": 1.1787806680148947,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.22549039380612612
+    },
+    {
+      "day": "2025-11-06",
+      "day_pnl": 0.1545608075381324,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.31992664191699305
+    },
+    {
+      "day": "2025-11-07",
+      "day_pnl": -1.592172321942769,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.9994360139173182
+    },
+    {
+      "day": "2025-11-09",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-11-10",
+      "day_pnl": 0.31924029760079975,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9923745035349043
+    },
+    {
+      "day": "2025-11-11",
+      "day_pnl": -3.2903638585507338,
+      "end_loss_streak": 0,
+      "intraday_dd": 3.2903638585507338
+    },
+    {
+      "day": "2025-11-12",
+      "day_pnl": -1.5174974760612372,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.8637109686941926
+    },
+    {
+      "day": "2025-11-13",
+      "day_pnl": 0.22839310580366146,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.6171574957890016
+    },
+    {
+      "day": "2025-11-14",
+      "day_pnl": -0.9390847744405164,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.903528165567991
+    },
+    {
+      "day": "2025-11-16",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-11-17",
+      "day_pnl": 1.3001660513207867,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.21671536468716113
+    },
+    {
+      "day": "2025-11-18",
+      "day_pnl": -3.3281964626038985,
+      "end_loss_streak": 0,
+      "intraday_dd": 3.435642215463872
+    },
+    {
+      "day": "2025-11-19",
+      "day_pnl": 3.2798568984076155,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.2575302381222855
+    },
+    {
+      "day": "2025-11-20",
+      "day_pnl": -0.05463960445729299,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.5301326960501456
+    },
+    {
+      "day": "2025-11-21",
+      "day_pnl": -0.5728125475812362,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.1004459418368242
+    },
+    {
+      "day": "2025-11-23",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-11-24",
+      "day_pnl": -1.9176002554874003,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.148939612760671
+    },
+    {
+      "day": "2025-11-25",
+      "day_pnl": -0.8578477754750224,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.4424823558941853
+    },
+    {
+      "day": "2025-11-26",
+      "day_pnl": -0.23830574748774325,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.8040362689220615
+    },
+    {
+      "day": "2025-11-27",
+      "day_pnl": -1.789546462804708,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.167529459877244
+    },
+    {
+      "day": "2025-11-28",
+      "day_pnl": -5.7811719759980065,
+      "end_loss_streak": 0,
+      "intraday_dd": 5.7811719759980065
+    },
+    {
+      "day": "2025-11-30",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-12-01",
+      "day_pnl": -0.03719175776672046,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.7755060395677447
+    },
+    {
+      "day": "2025-12-02",
+      "day_pnl": -1.9718440367826133,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.108364403795008
+    },
+    {
+      "day": "2025-12-03",
+      "day_pnl": -1.0946763715186876,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.4234145601625414
+    },
+    {
+      "day": "2025-12-04",
+      "day_pnl": -3.087288480894472,
+      "end_loss_streak": 0,
+      "intraday_dd": 3.087288480894472
+    },
+    {
+      "day": "2025-12-05",
+      "day_pnl": 1.376449425836313,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9702424561647263
+    },
+    {
+      "day": "2025-12-07",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-12-08",
+      "day_pnl": -1.914496717027646,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.1639644367656388
+    },
+    {
+      "day": "2025-12-09",
+      "day_pnl": -0.5555402374970413,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.5161093614886454
+    },
+    {
+      "day": "2025-12-10",
+      "day_pnl": -4.094286167102666,
+      "end_loss_streak": 0,
+      "intraday_dd": 4.1729107834722186
+    },
+    {
+      "day": "2025-12-11",
+      "day_pnl": -1.7758883172984383,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.983500482981242
+    },
+    {
+      "day": "2025-12-12",
+      "day_pnl": -1.0043349241101964,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.6144956080471502
+    },
+    {
+      "day": "2025-12-14",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-12-15",
+      "day_pnl": 0.9621913285368464,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.2622501084480291
+    },
+    {
+      "day": "2025-12-16",
+      "day_pnl": -4.2293443633572565,
+      "end_loss_streak": 0,
+      "intraday_dd": 4.2293443633572565
+    },
+    {
+      "day": "2025-12-17",
+      "day_pnl": -0.9370678710581615,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9623418632921243
+    },
+    {
+      "day": "2025-12-18",
+      "day_pnl": -1.4779967596452366,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.4779967596452366
+    },
+    {
+      "day": "2025-12-19",
+      "day_pnl": -1.8289564123845707,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.0685725731705134
+    },
+    {
+      "day": "2025-12-21",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-12-22",
+      "day_pnl": -2.6149229994643974,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.71639557104254
+    },
+    {
+      "day": "2025-12-23",
+      "day_pnl": -0.763772514060463,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.2022293818060916
+    },
+    {
+      "day": "2025-12-24",
+      "day_pnl": -3.7551488653809315,
+      "end_loss_streak": 0,
+      "intraday_dd": 3.7551488653809315
+    },
+    {
+      "day": "2025-12-25",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-12-26",
+      "day_pnl": -0.8674900734497442,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9917813304016931
+    },
+    {
+      "day": "2025-12-28",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2025-12-29",
+      "day_pnl": 0.5571990131541611,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.103377289502305
+    },
+    {
+      "day": "2025-12-30",
+      "day_pnl": 0.2554099067730249,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.7601329139552604
+    },
+    {
+      "day": "2025-12-31",
+      "day_pnl": -0.6205589057574343,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.2735965502263866
+    },
+    {
+      "day": "2026-01-01",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-01-02",
+      "day_pnl": 0.16979636276539622,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.2944824645001063
+    },
+    {
+      "day": "2026-01-04",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-01-05",
+      "day_pnl": -0.691276785247112,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9425388527850487
+    },
+    {
+      "day": "2026-01-06",
+      "day_pnl": -0.47778820335054206,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.7800661035921053
+    },
+    {
+      "day": "2026-01-07",
+      "day_pnl": -1.4253708284809363,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.8321896760533036
+    },
+    {
+      "day": "2026-01-08",
+      "day_pnl": 0.8484292957704156,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.22739781606435372
+    },
+    {
+      "day": "2026-01-09",
+      "day_pnl": 0.10590181441256163,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.886960125174312
+    },
+    {
+      "day": "2026-01-11",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-01-12",
+      "day_pnl": -0.3712535894841267,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.5660843368335691
+    },
+    {
+      "day": "2026-01-13",
+      "day_pnl": -2.0067744121478768,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.0067744121478768
+    },
+    {
+      "day": "2026-01-14",
+      "day_pnl": -0.18068637949357935,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.3471373537145155
+    },
+    {
+      "day": "2026-01-15",
+      "day_pnl": -0.4216352669077992,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.0658531106165015
+    },
+    {
+      "day": "2026-01-16",
+      "day_pnl": -0.07806119283213775,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.608994219510862
+    },
+    {
+      "day": "2026-01-18",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-01-19",
+      "day_pnl": -1.0461205929293556,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.2916760113085388
+    },
+    {
+      "day": "2026-01-20",
+      "day_pnl": -1.7984373041382469,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.0833306468866226
+    },
+    {
+      "day": "2026-01-21",
+      "day_pnl": -0.4857418401960558,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9439264850374229
+    },
+    {
+      "day": "2026-01-22",
+      "day_pnl": -0.9607519192945801,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.9607519192945801
+    },
+    {
+      "day": "2026-01-23",
+      "day_pnl": -0.44481412767243,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.9591115277214612
+    },
+    {
+      "day": "2026-01-25",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-01-26",
+      "day_pnl": -0.3108229941074683,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.618824951405827
+    },
+    {
+      "day": "2026-01-27",
+      "day_pnl": -0.04449288400081741,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.1724336923193732
+    },
+    {
+      "day": "2026-01-28",
+      "day_pnl": 1.578942499203265,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.35049022311500266
+    },
+    {
+      "day": "2026-01-29",
+      "day_pnl": -1.3504128446490995,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.3504128446490995
+    },
+    {
+      "day": "2026-01-30",
+      "day_pnl": 0.3114245917559515,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.7463941104049354
+    },
+    {
+      "day": "2026-02-01",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-02-02",
+      "day_pnl": 0.716200940367969,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.964403572708818
+    },
+    {
+      "day": "2026-02-03",
+      "day_pnl": -0.10908819756502908,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.4461767684941265
+    },
+    {
+      "day": "2026-02-04",
+      "day_pnl": 0.594933765162466,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.8041885110296221
+    },
+    {
+      "day": "2026-02-05",
+      "day_pnl": 0.24760121087388143,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.5988541026986809
+    },
+    {
+      "day": "2026-02-06",
+      "day_pnl": -2.489879679280648,
+      "end_loss_streak": 0,
+      "intraday_dd": 2.9489660555973956
+    },
+    {
+      "day": "2026-02-08",
+      "day_pnl": 0.0,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    },
+    {
+      "day": "2026-02-09",
+      "day_pnl": -0.5103200780057477,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.113495436752487
+    },
+    {
+      "day": "2026-02-10",
+      "day_pnl": -0.7469766724510123,
+      "end_loss_streak": 0,
+      "intraday_dd": 1.079036579234014
+    },
+    {
+      "day": "2026-02-11",
+      "day_pnl": 2.335377719211465,
+      "end_loss_streak": 0,
+      "intraday_dd": 0.0
+    }
+  ],
+  "perf_summary": {
+    "days": 91,
+    "end_day": "2026-02-11",
+    "max_dd": 5.7811719759980065,
+    "max_loss_streak": 0,
+    "profit_factor": 0.2195190953566812,
+    "start_day": "2025-10-29",
+    "total_pnl": -58.73845454412759,
+    "trades": 5631,
+    "winrate": 0.2087912087912088
+  },
+  "reasons": [],
+  "start_ts": "2025-10-29T11:11:00",
+  "status": "PASS",
+  "theta_len": 90
+}
