@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
 import os
 import subprocess
 import sys
@@ -11,6 +10,7 @@ import tempfile
 from typing import Any, Dict, Optional
 
 from rabit.meta import perf_history
+from rabit.state import atomic_io
 from rabit.state import promotion_gate
 from rabit.state.exit_codes import ExitCode
 from scripts import deterministic_utils as det
@@ -170,20 +170,7 @@ def _utc_iso() -> str:
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    dir_path = os.path.dirname(path)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=dir_path or None)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(det.stable_json_dumps(payload))
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+    atomic_io.atomic_write_text(path, det.stable_json_dumps(payload), suffix=".json")
 
 
 def _atomic_copy_file(src: str, dest: str) -> None:
@@ -352,21 +339,13 @@ def _ledger_metrics(
 
 
 def _append_ledger_entry(ledger_path: str, entry: Dict[str, Any]) -> None:
-    line = json.dumps(
+    atomic_io.append_jsonl_record(
+        ledger_path,
         entry,
+        ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
     )
-    ledger_dir = os.path.dirname(ledger_path)
-    if ledger_dir:
-        os.makedirs(ledger_dir, exist_ok=True)
-    with open(ledger_path, "a", encoding="utf-8") as f:
-        f.write(line)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
 
 
 def _build_ledger_entry(

@@ -15,24 +15,23 @@ import json
 import os
 import re
 import shlex
-import socket
 import subprocess
 import sys
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from rabit.state.exit_codes import ExitCode
+from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
 
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
+EXIT_LOCK_RETRYABLE = ExitCode.BUSINESS_SKIP
 EXIT_ERROR = ExitCode.INTERNAL_ERROR
-EXIT_LOCKED = ExitCode.LOCK_TIMEOUT
 
 DEFAULT_LOCK_PATH = os.path.join("data", "meta_states", ".locks", "meta_cycle.lock")
 DEFAULT_AUDIT_LOG_PATH = os.path.join("data", "reports", "meta_schedule.jsonl")
-DEFAULT_STALE_LOCK_SECONDS = 30 * 60
+DEFAULT_LOCK_TTL_SEC = 30 * 60
 
 _CYCLE_STATUS_RE = re.compile(r"^\[cycle\]\s+cycle_status=([^\s]+)", re.MULTILINE)
 _CYCLE_DECISION_RE = re.compile(r"^\[cycle\]\s+decision=([^\s]+)", re.MULTILINE)
@@ -54,15 +53,6 @@ class CycleExecResult:
     cycle_runtime_seconds: float
 
 
-@dataclass
-class LockHandle:
-    path: str
-    token: str
-    acquired_utc: str
-    acquired_epoch: float
-    takeover: bool
-
-
 def _utc_iso() -> str:
     now = dt.datetime.now(dt.timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -70,6 +60,10 @@ def _utc_iso() -> str:
 
 def _log(message: str) -> None:
     print(f"[schedule] {message}")
+
+
+def _lock_log(message: str) -> None:
+    print(f"[lock] {message}")
 
 
 def _json_dumps(payload: Dict[str, Any]) -> str:
@@ -95,16 +89,35 @@ def _parse_args() -> argparse.Namespace:
         help=f"Single-flight lock file path (default: {DEFAULT_LOCK_PATH}).",
     )
     ap.add_argument(
-        "--max_runtime_seconds",
+        "--lock_ttl_sec",
         type=float,
-        default=None,
-        help="Optional max wall-clock runtime for interval mode.",
+        default=float(DEFAULT_LOCK_TTL_SEC),
+        help="Lock TTL in seconds for stale detection (default: 1800).",
     )
     ap.add_argument(
         "--stale_lock_seconds",
         type=float,
         default=None,
-        help="Optional stale lock threshold. Default is 2*interval or 1800 seconds.",
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--force_lock_break",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Allow stale lock takeover when age > lock_ttl_sec (0/1).",
+    )
+    ap.add_argument(
+        "--on_lock_held",
+        choices=["skip", "retryable", "fail"],
+        default="skip",
+        help="Action when lock is held: skip=0, retryable=11, fail=50.",
+    )
+    ap.add_argument(
+        "--max_runtime_seconds",
+        type=float,
+        default=None,
+        help="Optional max wall-clock runtime for interval mode.",
     )
     ap.add_argument(
         "--audit_log_path",
@@ -168,142 +181,33 @@ def _scheduler_status_from_return_code(return_code: int) -> str:
     rc = int(return_code)
     if rc in (ExitCode.SUCCESS, ExitCode.BUSINESS_REJECT):
         return "OK"
+    if rc == ExitCode.BUSINESS_SKIP:
+        return "RETRYABLE"
     return "ERROR"
 
 
-def _read_lock_payload(lock_path: str) -> Dict[str, Any]:
-    if not os.path.exists(lock_path):
-        return {}
-    try:
-        with open(lock_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if isinstance(payload, dict):
-            return payload
-    except Exception:
-        pass
-    return {}
-
-
-def _lock_created_epoch(lock_path: str, payload: Dict[str, Any]) -> float:
-    raw_epoch = payload.get("created_epoch")
-    if isinstance(raw_epoch, (int, float)):
-        return float(raw_epoch)
-    try:
-        return float(os.path.getmtime(lock_path))
-    except Exception:
-        return 0.0
-
-
-def _effective_stale_seconds(args: argparse.Namespace) -> float:
+def _effective_lock_ttl_sec(args: argparse.Namespace) -> float:
     if args.stale_lock_seconds is not None:
         return max(1.0, float(args.stale_lock_seconds))
-    if args.interval_minutes is not None:
-        return max(1.0, float(args.interval_minutes) * 2.0 * 60.0)
-    return float(DEFAULT_STALE_LOCK_SECONDS)
+    return max(1.0, float(args.lock_ttl_sec))
 
 
-def _try_create_lock(lock_path: str, payload: Dict[str, Any]) -> bool:
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    fd = os.open(lock_path, flags)
-    try:
-        line = _json_dumps(payload)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(line)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-    except Exception:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-        raise
-    return True
+def _lock_policy_exit_code(policy: str) -> int:
+    normalized = str(policy or "skip").strip().lower()
+    if normalized == "retryable":
+        return int(EXIT_LOCK_RETRYABLE)
+    if normalized == "fail":
+        return int(EXIT_ERROR)
+    return int(EXIT_OK)
 
 
-def _acquire_lock(lock_path: str, stale_seconds: float, reason: str) -> tuple[Optional[LockHandle], str, float]:
-    lock_dir = os.path.dirname(lock_path)
-    if lock_dir:
-        os.makedirs(lock_dir, exist_ok=True)
-
-    now_epoch = time.time()
-    token = str(uuid.uuid4())
-    payload = {
-        "token": token,
-        "pid": int(os.getpid()),
-        "host": socket.gethostname(),
-        "reason": reason,
-        "created_utc": _utc_iso(),
-        "created_epoch": now_epoch,
-    }
-
-    try:
-        _try_create_lock(lock_path, payload)
-        return (
-            LockHandle(
-                path=lock_path,
-                token=token,
-                acquired_utc=str(payload["created_utc"]),
-                acquired_epoch=float(payload["created_epoch"]),
-                takeover=False,
-            ),
-            "ACQUIRED",
-            0.0,
-        )
-    except FileExistsError:
-        existing = _read_lock_payload(lock_path)
-        created_epoch = _lock_created_epoch(lock_path, existing)
-        age_seconds = max(0.0, now_epoch - created_epoch)
-        if age_seconds <= stale_seconds:
-            return (None, "LOCKED_FRESH", age_seconds)
-
-        _log(
-            f"lock_stale_detected path={lock_path} age_seconds={age_seconds:.3f} stale_threshold_seconds={stale_seconds:.3f}"
-        )
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            return (None, "LOCKED_FRESH", age_seconds)
-
-        now_epoch = time.time()
-        payload["created_epoch"] = now_epoch
-        payload["created_utc"] = _utc_iso()
-        try:
-            _try_create_lock(lock_path, payload)
-            return (
-                LockHandle(
-                    path=lock_path,
-                    token=token,
-                    acquired_utc=str(payload["created_utc"]),
-                    acquired_epoch=float(payload["created_epoch"]),
-                    takeover=True,
-                ),
-                "ACQUIRED_STALE_TAKEOVER",
-                age_seconds,
-            )
-        except FileExistsError:
-            return (None, "LOCKED_FRESH", age_seconds)
-
-
-def _release_lock(lock: LockHandle) -> bool:
-    if not lock or not lock.path:
-        return False
-    if not os.path.exists(lock.path):
-        return False
-    payload = _read_lock_payload(lock.path)
-    lock_token = str(payload.get("token", "")).strip()
-    if lock_token and lock_token != lock.token:
-        _log("release_lock skipped=1 reason=not_owner")
-        return False
-    try:
-        os.remove(lock.path)
-        return True
-    except FileNotFoundError:
-        return False
-    except Exception:
-        return False
+def _lock_policy_scheduler_status(policy: str) -> str:
+    normalized = str(policy or "skip").strip().lower()
+    if normalized == "retryable":
+        return "LOCKED_RETRYABLE"
+    if normalized == "fail":
+        return "LOCKED_FAIL"
+    return "LOCKED_SKIP"
 
 
 def _shell_join(parts: List[str]) -> str:
@@ -342,6 +246,8 @@ def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecRes
         str(int(strict)),
         "--dry_run",
         str(int(dry_run)),
+        "--skip_global_lock",
+        "1",
     ]
     _log(f"cycle_start cmd={_shell_join(cmd)}")
     t0 = time.perf_counter()
@@ -446,6 +352,7 @@ def _build_audit_record(
     lock_status: str,
     lock_age_seconds: float,
     scheduler_runtime_seconds: float,
+    lock_return_code: int = EXIT_OK,
 ) -> Dict[str, Any]:
     entry: Dict[str, Any] = {
         "timestamp": _utc_iso(),
@@ -467,7 +374,7 @@ def _build_audit_record(
         "ledger_path": cycle_result.ledger_path if cycle_result else "",
         "candidate_hash": cycle_result.candidate_hash if cycle_result else "missing",
         "approved_hash": cycle_result.approved_hash if cycle_result else "missing",
-        "cycle_return_code": int(cycle_result.return_code) if cycle_result else EXIT_LOCKED,
+        "cycle_return_code": int(cycle_result.return_code) if cycle_result else int(lock_return_code),
     }
     return entry
 
@@ -485,28 +392,41 @@ def _sleep_interval(interval_seconds: float, started_at: float, max_runtime_seco
     return True
 
 
-def _run_once(args: argparse.Namespace, stale_seconds: float) -> int:
+def _run_once(args: argparse.Namespace, lock_ttl_sec: float) -> int:
     sched_t0 = time.perf_counter()
-    lock, lock_status, lock_age_seconds = _acquire_lock(args.lock_path, stale_seconds=stale_seconds, reason=args.reason)
-    if lock is None:
-        _log(f"status=LOCKED lock_path={args.lock_path} lock_age_seconds={lock_age_seconds:.3f}")
-        _log("decision=LOCKED")
-        _log("cycle_status=LOCKED")
+    policy = str(args.on_lock_held).strip().lower()
+    lock_result = acquire_exclusive_lock(
+        lock_path=args.lock_path,
+        reason=args.reason,
+        ttl_sec=lock_ttl_sec,
+        force_lock_break=(int(args.force_lock_break) == 1),
+    )
+    if not lock_result.acquired:
+        lock_exit_code = _lock_policy_exit_code(policy)
+        _lock_log(
+            f"held_by={lock_owner_summary(lock_result.owner)} age_s={lock_result.age_s:.3f} action={policy}"
+        )
         record = _build_audit_record(
             args=args,
             mode="run_once",
             cycle_result=None,
-            scheduler_status="LOCKED",
-            lock_status=lock_status,
-            lock_age_seconds=lock_age_seconds,
+            scheduler_status=_lock_policy_scheduler_status(policy),
+            lock_status=lock_result.status,
+            lock_age_seconds=lock_result.age_s,
             scheduler_runtime_seconds=time.perf_counter() - sched_t0,
+            lock_return_code=lock_exit_code,
         )
         _append_audit_record(args.audit_log_path, record)
-        return EXIT_LOCKED
+        return int(lock_exit_code)
 
-    _log(
-        f"acquired_lock path={args.lock_path} status={lock_status} "
-        f"takeover={1 if lock.takeover else 0} acquired_utc={lock.acquired_utc}"
+    lock_handle = lock_result.handle
+    if lock_handle is None:
+        _lock_log("status=error reason=missing_lock_handle")
+        return int(EXIT_ERROR)
+
+    _lock_log(
+        f"acquired path={args.lock_path} status={lock_result.status} stale_break={1 if lock_handle.stale_break else 0} "
+        f"owner={lock_owner_summary(lock_result.owner)}"
     )
     cycle_result: Optional[CycleExecResult] = None
     try:
@@ -522,8 +442,8 @@ def _run_once(args: argparse.Namespace, stale_seconds: float) -> int:
             mode="run_once",
             cycle_result=cycle_result,
             scheduler_status=scheduler_status,
-            lock_status=lock_status,
-            lock_age_seconds=lock_age_seconds,
+            lock_status=lock_result.status,
+            lock_age_seconds=lock_result.age_s,
             scheduler_runtime_seconds=time.perf_counter() - sched_t0,
         )
         _append_audit_record(args.audit_log_path, record)
@@ -532,11 +452,11 @@ def _run_once(args: argparse.Namespace, stale_seconds: float) -> int:
             return EXIT_OK
         return int(cycle_result.return_code)
     finally:
-        released = _release_lock(lock)
-        _log(f"release_lock path={args.lock_path} removed={1 if released else 0}")
+        released = release_exclusive_lock(lock_handle)
+        _lock_log(f"released path={args.lock_path} ok={1 if released else 0}")
 
 
-def _run_interval_loop(args: argparse.Namespace, stale_seconds: float) -> int:
+def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float) -> int:
     if args.interval_minutes is None or float(args.interval_minutes) <= 0:
         raise ValueError("interval_minutes must be > 0 for loop mode")
 
@@ -545,6 +465,7 @@ def _run_interval_loop(args: argparse.Namespace, stale_seconds: float) -> int:
     if args.max_runtime_seconds is not None:
         max_runtime_seconds = max(0.0, float(args.max_runtime_seconds))
 
+    policy = str(args.on_lock_held).strip().lower()
     loop_t0 = time.monotonic()
     cycle_idx = 0
     while True:
@@ -558,37 +479,43 @@ def _run_interval_loop(args: argparse.Namespace, stale_seconds: float) -> int:
         _log(f"cycle_tick index={cycle_idx} reason={cycle_reason}")
 
         sched_t0 = time.perf_counter()
-        lock, lock_status, lock_age_seconds = _acquire_lock(
-            args.lock_path,
-            stale_seconds=stale_seconds,
+        lock_result = acquire_exclusive_lock(
+            lock_path=args.lock_path,
             reason=cycle_reason,
+            ttl_sec=lock_ttl_sec,
+            force_lock_break=(int(args.force_lock_break) == 1),
         )
-        if lock is None:
-            _log(
-                "status=LOCKED "
-                f"cycle_tick={cycle_idx} "
-                f"lock_path={args.lock_path} "
-                f"lock_age_seconds={lock_age_seconds:.3f} "
-                "action=skip"
+        if not lock_result.acquired:
+            lock_exit_code = _lock_policy_exit_code(policy)
+            _lock_log(
+                f"held_by={lock_owner_summary(lock_result.owner)} age_s={lock_result.age_s:.3f} action={policy}"
             )
             record = _build_audit_record(
                 args=args,
                 mode="interval",
                 cycle_result=None,
-                scheduler_status="LOCKED_SKIP",
-                lock_status=lock_status,
-                lock_age_seconds=lock_age_seconds,
+                scheduler_status=_lock_policy_scheduler_status(policy),
+                lock_status=lock_result.status,
+                lock_age_seconds=lock_result.age_s,
                 scheduler_runtime_seconds=time.perf_counter() - sched_t0,
+                lock_return_code=lock_exit_code,
             )
             _append_audit_record(args.audit_log_path, record)
+            if policy != "skip":
+                return int(lock_exit_code)
             if not _sleep_interval(interval_seconds, tick_t0, max_runtime_seconds, loop_t0):
                 _log("max_runtime_reached=1 -> stop")
                 return EXIT_OK
             continue
 
-        _log(
-            f"acquired_lock path={args.lock_path} status={lock_status} "
-            f"takeover={1 if lock.takeover else 0} acquired_utc={lock.acquired_utc}"
+        lock_handle = lock_result.handle
+        if lock_handle is None:
+            _lock_log("status=error reason=missing_lock_handle")
+            return int(EXIT_ERROR)
+
+        _lock_log(
+            f"acquired path={args.lock_path} status={lock_result.status} stale_break={1 if lock_handle.stale_break else 0} "
+            f"owner={lock_owner_summary(lock_result.owner)}"
         )
         cycle_result: Optional[CycleExecResult] = None
         try:
@@ -604,14 +531,14 @@ def _run_interval_loop(args: argparse.Namespace, stale_seconds: float) -> int:
                 mode="interval",
                 cycle_result=cycle_result,
                 scheduler_status=scheduler_status,
-                lock_status=lock_status,
-                lock_age_seconds=lock_age_seconds,
+                lock_status=lock_result.status,
+                lock_age_seconds=lock_result.age_s,
                 scheduler_runtime_seconds=time.perf_counter() - sched_t0,
             )
             _append_audit_record(args.audit_log_path, record)
         finally:
-            released = _release_lock(lock)
-            _log(f"release_lock path={args.lock_path} removed={1 if released else 0}")
+            released = release_exclusive_lock(lock_handle)
+            _lock_log(f"released path={args.lock_path} ok={1 if released else 0}")
 
         if _is_business_reject_outcome(cycle_result):
             _log("business_reject_not_error")
@@ -632,16 +559,17 @@ def main() -> int:
     if int(args.run_once) == 1 and args.interval_minutes is not None:
         _log("run_once=1 and interval_minutes provided -> interval ignored")
 
-    stale_seconds = _effective_stale_seconds(args)
+    lock_ttl_sec = _effective_lock_ttl_sec(args)
     _log(
         f"start mode={mode} csv={args.csv} reason={args.reason} strict={int(args.strict)} "
-        f"dry_run={int(args.dry_run)} lock_path={args.lock_path} stale_lock_seconds={stale_seconds:.3f}"
+        f"dry_run={int(args.dry_run)} lock_path={args.lock_path} lock_ttl_sec={lock_ttl_sec:.3f} "
+        f"force_lock_break={int(args.force_lock_break)} on_lock_held={args.on_lock_held}"
     )
 
     try:
         if mode == "run_once":
-            return _run_once(args, stale_seconds=stale_seconds)
-        return _run_interval_loop(args, stale_seconds=stale_seconds)
+            return _run_once(args, lock_ttl_sec=lock_ttl_sec)
+        return _run_interval_loop(args, lock_ttl_sec=lock_ttl_sec)
     except KeyboardInterrupt:
         _log("status=INTERRUPTED")
         return 130

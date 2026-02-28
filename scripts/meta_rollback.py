@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from rabit.rl.meta_risk import MetaRiskState
+from rabit.state import atomic_io
 from scripts import deterministic_utils as det
 
 DEFAULT_BASE_DIR = os.path.join("data", "meta_states")
@@ -141,21 +142,13 @@ def _atomic_replace_from_source(src: str, dest: str) -> None:
 
 
 def _append_ledger_entry(ledger_path: str, entry: Dict[str, Any]) -> None:
-    line = json.dumps(
+    atomic_io.append_jsonl_record(
+        ledger_path,
         entry,
+        ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
     )
-    ledger_dir = os.path.dirname(ledger_path)
-    if ledger_dir:
-        os.makedirs(ledger_dir, exist_ok=True)
-    with open(ledger_path, "a", encoding="utf-8") as f:
-        f.write(line)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
 
 
 def _load_ledger_events(ledger_path: str) -> List[Dict[str, Any]]:

@@ -31,3 +31,4 @@ data/snapshots/**
 data/meta_states/candidate/**
 data/meta_states/history/**
 data/meta_states/rejected/**
+data/meta_states/.locks/**

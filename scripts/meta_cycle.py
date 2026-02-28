@@ -16,9 +16,11 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from rabit.state.exit_codes import ExitCode
+from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
 
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
+EXIT_LOCK_RETRYABLE = ExitCode.BUSINESS_SKIP
 EXIT_ERROR = ExitCode.INTERNAL_ERROR
 
 DEFAULT_APPROVED_STATE_PATH = os.path.join("data", "meta_states", "current_approved", "meta_risk_state.json")
@@ -27,6 +29,7 @@ DEFAULT_CANDIDATE_MANIFEST = os.path.join("data", "meta_states", "candidate", "m
 DEFAULT_SHADOW_REPORT = os.path.join("data", "reports", "shadow_replay_report.json")
 DEFAULT_LEDGER_PATH = os.path.join("data", "meta_states", "ledger.jsonl")
 DEFAULT_HEALTH_OUT_DIR = os.path.join("data", "reports", "meta_cycle_healthcheck")
+DEFAULT_LOCK_PATH = os.path.join("data", "meta_states", ".locks", "meta_cycle.lock")
 
 _PROMOTION_STATUS_RE = re.compile(r"\[promotion\]\s+STATUS=([A-Z]+)")
 _CANDIDATE_HASH_RE = re.compile(r"\bcandidate_hash=([0-9a-f]{64}|missing)\b")
@@ -68,6 +71,37 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--csv", required=True, help="Input bars CSV path")
     ap.add_argument("--reason", required=True, help="Cycle reason string")
     ap.add_argument("--strict", type=int, choices=[0, 1], default=1, help="Strict mode (0/1)")
+    ap.add_argument(
+        "--lock_path",
+        default=DEFAULT_LOCK_PATH,
+        help=f"Global lock path (default: {DEFAULT_LOCK_PATH})",
+    )
+    ap.add_argument(
+        "--lock_ttl_sec",
+        type=float,
+        default=1800.0,
+        help="Lock TTL seconds for stale detection (default: 1800)",
+    )
+    ap.add_argument(
+        "--force_lock_break",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Allow stale lock takeover when age > lock_ttl_sec (0/1)",
+    )
+    ap.add_argument(
+        "--on_lock_held",
+        choices=["skip", "retryable", "fail"],
+        default=None,
+        help="Lock-held action override. Default: strict=1->retryable, strict=0->skip",
+    )
+    ap.add_argument(
+        "--skip_global_lock",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--risk_per_trade", type=float, default=None, help="Optional passthrough to validation sims")
     ap.add_argument(
         "--account_equity_start",
@@ -90,6 +124,27 @@ def _parse_args() -> argparse.Namespace:
 
 def _log(message: str) -> None:
     print(f"[cycle] {message}")
+
+
+def _lock_log(message: str) -> None:
+    print(f"[lock] {message}")
+
+
+def _effective_lock_policy(args: argparse.Namespace) -> str:
+    requested = args.on_lock_held
+    if requested:
+        return str(requested).strip().lower()
+    strict = int(args.strict) == 1
+    return "retryable" if strict else "skip"
+
+
+def _lock_policy_exit_code(policy: str) -> int:
+    normalized = str(policy or "skip").strip().lower()
+    if normalized == "retryable":
+        return int(EXIT_LOCK_RETRYABLE)
+    if normalized == "fail":
+        return int(EXIT_ERROR)
+    return int(EXIT_OK)
 
 
 def _shell_join(parts: List[str]) -> str:
@@ -528,14 +583,48 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
 def main() -> int:
     args = _parse_args()
     dry_run = int(args.dry_run) == 1
-    if dry_run:
-        with tempfile.TemporaryDirectory(prefix="meta_cycle_") as temp_root:
-            paths = _build_paths(dry_run=True, temp_root=temp_root)
-            _prepare_dry_run_state(paths)
-            return _run_cycle(args, paths, dry_run=True)
+    skip_global_lock = int(args.skip_global_lock) == 1
+    lock_policy = _effective_lock_policy(args)
 
-    paths = _build_paths(dry_run=False, temp_root=None)
-    return _run_cycle(args, paths, dry_run=False)
+    def _run_with_paths() -> int:
+        if dry_run:
+            with tempfile.TemporaryDirectory(prefix="meta_cycle_") as temp_root:
+                paths = _build_paths(dry_run=True, temp_root=temp_root)
+                _prepare_dry_run_state(paths)
+                return _run_cycle(args, paths, dry_run=True)
+        paths = _build_paths(dry_run=False, temp_root=None)
+        return _run_cycle(args, paths, dry_run=False)
+
+    if skip_global_lock:
+        _lock_log("status=skip reason=skip_global_lock=1")
+        return _run_with_paths()
+
+    lock_result = acquire_exclusive_lock(
+        lock_path=args.lock_path,
+        reason=args.reason,
+        ttl_sec=max(1.0, float(args.lock_ttl_sec)),
+        force_lock_break=(int(args.force_lock_break) == 1),
+    )
+    if not lock_result.acquired:
+        _lock_log(
+            f"held_by={lock_owner_summary(lock_result.owner)} age_s={lock_result.age_s:.3f} action={lock_policy}"
+        )
+        return _lock_policy_exit_code(lock_policy)
+
+    lock_handle = lock_result.handle
+    if lock_handle is None:
+        _lock_log("status=error reason=missing_lock_handle")
+        return int(EXIT_ERROR)
+
+    _lock_log(
+        f"acquired path={args.lock_path} status={lock_result.status} "
+        f"stale_break={1 if lock_handle.stale_break else 0} owner={lock_owner_summary(lock_result.owner)}"
+    )
+    try:
+        return _run_with_paths()
+    finally:
+        released = release_exclusive_lock(lock_handle)
+        _lock_log(f"released path={args.lock_path} ok={1 if released else 0}")
 
 
 if __name__ == "__main__":

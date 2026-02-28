@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from typing import Any, Dict, List, Optional, Tuple
+
+from rabit.state import atomic_io
 
 DEFAULT_BASE_DIR = os.path.join("data", "meta_states")
 DEFAULT_STATE_FILE = "meta_risk_state.json"
@@ -71,20 +72,7 @@ def _stable_json_text(data: Any) -> str:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    dir_path = os.path.dirname(path)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=dir_path or None)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+    atomic_io.atomic_write_text(path, text, suffix=".json")
 
 
 def _atomic_write_json(path: str, data: Any) -> bool:
