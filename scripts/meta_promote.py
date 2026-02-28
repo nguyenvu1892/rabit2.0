@@ -112,6 +112,28 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--debug", type=int, default=0, help="Debug mode (0/1)")
     ap.add_argument("--cycle_id", default="", help="Optional correlation id propagated by meta_cycle")
     ap.add_argument(
+        "--eval_only",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Evaluate gate/scoring only (no promotion, no reject move, no ledger write).",
+    )
+    ap.add_argument(
+        "--eval_report_path",
+        default="",
+        help="Optional JSON path for eval-only payload.",
+    )
+    ap.add_argument(
+        "--ledger_extra_path",
+        default="",
+        help="Optional JSON path for additive ledger fields.",
+    )
+    ap.add_argument(
+        "--holdout_report_path",
+        default=DEFAULT_HOLDOUT_REPORT_PATH,
+        help="Optional holdout report path for score_holdout.",
+    )
+    ap.add_argument(
         "--enable_scoring",
         type=int,
         choices=[0, 1],
@@ -358,6 +380,18 @@ def _load_optional_holdout_report(path: str = DEFAULT_HOLDOUT_REPORT_PATH) -> Op
     return None
 
 
+def _load_optional_extra_fields(path: str) -> Dict[str, Any]:
+    source = str(path or "").strip()
+    if not source:
+        return {}
+    if not os.path.exists(source):
+        raise RuntimeError(f"ledger_extra_missing path={source}")
+    payload, _ = atomic_io.load_json_with_fallback(source)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"ledger_extra_invalid type={type(payload).__name__}")
+    return dict(payload)
+
+
 def _deterministic_hash_from_perf_history(payload: Dict[str, Any]) -> str:
     run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
     data = {
@@ -427,6 +461,7 @@ def _compute_scoring_fields(
     w_pnl: float,
     w_win: float,
     w_dd: float,
+    holdout_report_path: str = DEFAULT_HOLDOUT_REPORT_PATH,
 ) -> Dict[str, Any]:
     fields = _base_scoring_fields(enabled=enable_scoring, w_pnl=w_pnl, w_win=w_win, w_dd=w_dd)
     if not enable_scoring:
@@ -435,7 +470,7 @@ def _compute_scoring_fields(
     in_sample_metrics = perf_history.perf_metrics_from_history(perf_payload)
     score_payload = scoring.compute_scores(
         in_sample_metrics,
-        holdout_report=_load_optional_holdout_report(DEFAULT_HOLDOUT_REPORT_PATH),
+        holdout_report=_load_optional_holdout_report(holdout_report_path),
         w_pnl=float(w_pnl),
         w_win=float(w_win),
         w_dd=float(w_dd),
@@ -461,6 +496,7 @@ def _build_ledger_entry(
     decision: str,
     reason: str = "",
     scoring_fields: Optional[Dict[str, Any]] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     replay_hash = result.replay_hash
     if not replay_hash or replay_hash == "missing":
@@ -480,6 +516,11 @@ def _build_ledger_entry(
     }
     if isinstance(scoring_fields, dict):
         entry.update(scoring_fields)
+    if isinstance(extra_fields, dict):
+        for key, value in extra_fields.items():
+            if key in entry:
+                continue
+            entry[str(key)] = value
     return entry
 
 
@@ -513,6 +554,11 @@ def run(
     replay_check = int(args.replay_check) == 1
     no_exit_on_reject = int(args.no_exit_on_reject) == 1
     debug = int(args.debug) == 1
+    eval_only = int(getattr(args, "eval_only", 0)) == 1
+    eval_report_path = str(getattr(args, "eval_report_path", "") or "").strip()
+    holdout_report_path = str(
+        getattr(args, "holdout_report_path", DEFAULT_HOLDOUT_REPORT_PATH) or DEFAULT_HOLDOUT_REPORT_PATH
+    )
     enable_scoring = int(getattr(args, "enable_scoring", 0)) == 1
     w_pnl = float(getattr(args, "w_pnl", 1.0))
     w_win = float(getattr(args, "w_win", 1.0))
@@ -554,6 +600,96 @@ def run(
         w_win=w_win,
         w_dd=w_dd,
     )
+    try:
+        ledger_extra_fields = _load_optional_extra_fields(str(getattr(args, "ledger_extra_path", "") or ""))
+    except Exception as exc:
+        _print_summary_line(
+            "FAIL",
+            str(exc),
+            result,
+            perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+        )
+        return ExitCode.DATA_INVALID
+
+    if eval_only:
+        gate_status = "PASS"
+        gate_reason = str(result.reason)
+        eval_rc = int(EXIT_OK)
+        if not result.ok:
+            processing_error_exit_code = _processing_error_exit_code(result.reason)
+            if processing_error_exit_code is not None:
+                gate_status = "FAIL"
+                eval_rc = int(processing_error_exit_code)
+            else:
+                gate_status = "REJECT"
+                eval_rc = int(EXIT_OK)
+        else:
+            try:
+                perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
+            except Exception as exc:
+                gate_status = "FAIL"
+                gate_reason = str(exc)
+                eval_rc = int(ExitCode.DATA_INVALID)
+            else:
+                scoring_fields = _compute_scoring_fields(
+                    perf_payload=perf_payload,
+                    enable_scoring=enable_scoring,
+                    w_pnl=w_pnl,
+                    w_win=w_win,
+                    w_dd=w_dd,
+                    holdout_report_path=holdout_report_path,
+                )
+                if logger is not None:
+                    event_fields: Dict[str, Any] = {
+                        "stage": "meta_promote",
+                        "cycle_id": cycle_id,
+                        "candidate_hash": result.candidate_hash,
+                        "score_total": scoring_fields.get("score_total"),
+                        "gate_status": gate_status,
+                    }
+                    if scoring_fields.get("score_holdout") is not None:
+                        event_fields["score_holdout"] = scoring_fields.get("score_holdout")
+                    logger.info(event="scoring_computed", **event_fields)
+
+        eval_payload: Dict[str, Any] = {
+            "gate_status": gate_status,
+            "gate_reason": gate_reason,
+            "candidate_hash": result.candidate_hash,
+            "approved_hash": result.approved_hash,
+            "replay_hash": result.replay_hash,
+            "score_total": scoring_fields.get("score_total"),
+            "score_in_sample": scoring_fields.get("score_in_sample"),
+            "score_holdout": scoring_fields.get("score_holdout"),
+            "score_components": scoring_fields.get("score_components"),
+            "scoring_notes": scoring_fields.get("scoring_notes"),
+            "scoring_enabled": int(enable_scoring),
+        }
+        if eval_report_path:
+            try:
+                _atomic_write_json(eval_report_path, eval_payload)
+            except Exception as exc:
+                _print_summary_line(
+                    "FAIL",
+                    f"eval_report_write_failed {exc}",
+                    result,
+                    perf_summary,
+                    perf_reason=perf_summary.get("perf_reason"),
+                )
+                return ExitCode.STATE_CORRUPT
+
+        _print_summary_line(
+            gate_status,
+            gate_reason,
+            result,
+            perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+            score_total=_safe_summary_value(scoring_fields.get("score_total")),
+            score_holdout=_safe_summary_value(scoring_fields.get("score_holdout")),
+            scoring_enabled=int(enable_scoring),
+            eval_only=1,
+        )
+        return int(eval_rc)
 
     if not result.ok:
         processing_error_exit_code = _processing_error_exit_code(result.reason)
@@ -577,6 +713,7 @@ def run(
                 decision="rejected",
                 reason=result.reason,
                 scoring_fields=scoring_fields,
+                extra_fields=ledger_extra_fields,
             )
         except Exception as exc:
             _print_summary_line(
@@ -664,6 +801,7 @@ def run(
         w_pnl=w_pnl,
         w_win=w_win,
         w_dd=w_dd,
+        holdout_report_path=holdout_report_path,
     )
     if enable_scoring and logger is not None:
         event_fields: Dict[str, Any] = {
@@ -702,6 +840,7 @@ def run(
             base_hash=base_hash,
             decision="approved",
             scoring_fields=scoring_fields,
+            extra_fields=ledger_extra_fields,
         )
         _append_ledger_entry(args.ledger_path, ledger_entry)
     except Exception as exc:

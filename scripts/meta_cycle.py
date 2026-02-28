@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import hashlib
 import os
+import random
 import re
 import shlex
 import shutil
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rabit.state import atomic_io
 from rabit.state.anomaly_guardrail import detect_anomaly
@@ -42,6 +43,10 @@ _LEDGER_PATH_RE = re.compile(r"\bledger_path=([^\s]+)")
 _DETERMINISTIC_STATUS_RE = re.compile(r"\[deterministic\]\s+STATUS=(PASS|FAIL)")
 _HEALTHCHECK_STATUS_RE = re.compile(r"\[healthcheck\]\s+STATUS=(PASS|FAIL)")
 
+_MUTATION_K_MIN = 3
+_MUTATION_K_MAX = 5
+_MUTATION_K_DEFAULT = 5
+
 
 @dataclass
 class StageResult:
@@ -69,6 +74,33 @@ class CyclePaths:
     promote_rejected_dir: str
     promote_ledger_path: str
     health_out_dir: str
+
+
+@dataclass
+class MutationCandidate:
+    index: int
+    candidate_path: str
+    candidate_manifest_path: str
+    shadow_out_json: str
+    eval_report_path: str
+    candidate_hash: str
+    param_diff_summary: List[str]
+    gate_status: str
+    gate_reason: str
+    score_total: Optional[float]
+    score_holdout: Optional[float]
+
+
+@dataclass
+class MutationSelection:
+    candidates: List[MutationCandidate]
+    selected: Optional[MutationCandidate]
+    k_candidates: int
+    mutation_seed: int
+    mutation_seed_basis: str
+    mutation_profile: str
+    selection_reason: str
+    ledger_extra_path: str
 
 
 def _parse_args() -> argparse.Namespace:
@@ -179,6 +211,25 @@ def _parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--skip_replay", type=int, choices=[0, 1], default=0, help="Skip shadow replay step")
     ap.add_argument("--skip_promote", type=int, choices=[0, 1], default=0, help="Skip promotion gate step")
+    ap.add_argument(
+        "--opt_mutation",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Enable bounded deterministic multi-candidate mutation selection (0/1).",
+    )
+    ap.add_argument(
+        "--k_candidates",
+        type=int,
+        default=_MUTATION_K_DEFAULT,
+        help=f"Candidate count for mutation search (clamped to [{_MUTATION_K_MIN},{_MUTATION_K_MAX}]).",
+    )
+    ap.add_argument("--mutation_seed", default="", help="Optional deterministic mutation seed string.")
+    ap.add_argument(
+        "--mutation_profile",
+        default="safe",
+        help='Mutation profile (currently only "safe" is implemented).',
+    )
     ap.add_argument("--cycle_id", default="", help="Optional correlation id propagated across cycle stages")
     return ap.parse_args()
 
@@ -400,6 +451,404 @@ def _append_optional_risk_args(cli: List[str], args: argparse.Namespace) -> None
         cli.extend(["--account_equity_start", str(float(args.account_equity_start))])
 
 
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if out != out:
+        return None
+    if out in (float("inf"), float("-inf")):
+        return None
+    return float(out)
+
+
+def _round8_or_none(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), 8)
+
+
+def _clamp_k_candidates(raw_value: Any) -> int:
+    try:
+        out = int(raw_value)
+    except Exception:
+        out = _MUTATION_K_DEFAULT
+    if out < _MUTATION_K_MIN:
+        return _MUTATION_K_MIN
+    if out > _MUTATION_K_MAX:
+        return _MUTATION_K_MAX
+    return int(out)
+
+
+def _resolve_mutation_seed(
+    *,
+    approved_hash: str,
+    reason: str,
+    k_candidates: int,
+    mutation_profile: str,
+    mutation_seed_arg: str,
+) -> Tuple[int, str]:
+    provided = str(mutation_seed_arg or "").strip()
+    if provided:
+        seed_basis = provided
+    else:
+        seed_basis = f"{approved_hash}|{reason}|{int(k_candidates)}|{mutation_profile}"
+    seed = int(hashlib.sha1(seed_basis.encode("utf-8")).hexdigest()[:8], 16)
+    return int(seed), seed_basis
+
+
+def _load_json_dict(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    payload, _ = atomic_io.load_json_with_fallback(path)
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {}
+
+
+def _manifest_param_diff_summary(path: str) -> List[str]:
+    payload = _load_json_dict(path)
+    summary = payload.get("param_diff_summary")
+    if isinstance(summary, list):
+        return [str(item) for item in summary]
+    if isinstance(summary, str) and summary.strip():
+        return [summary.strip()]
+    return ["BASE"]
+
+
+def _run_mutation_selection(
+    *,
+    args: argparse.Namespace,
+    paths: CyclePaths,
+    dry_run: bool,
+    logger: StructuredLogger,
+    cycle_id: str,
+    approved_hash: str,
+) -> MutationSelection:
+    profile = str(getattr(args, "mutation_profile", "safe") or "safe").strip().lower()
+    if profile != "safe":
+        raise RuntimeError(f"unsupported_mutation_profile profile={profile}")
+
+    k_candidates = _clamp_k_candidates(getattr(args, "k_candidates", _MUTATION_K_DEFAULT))
+    seed, seed_basis = _resolve_mutation_seed(
+        approved_hash=str(approved_hash),
+        reason=str(args.reason),
+        k_candidates=int(k_candidates),
+        mutation_profile=profile,
+        mutation_seed_arg=str(getattr(args, "mutation_seed", "") or ""),
+    )
+    rng = random.Random(int(seed))
+    candidate_parent = os.path.dirname(paths.candidate_path) or os.path.join("data", "meta_states", "candidate")
+    mutation_root = os.path.join(candidate_parent, "mutation", str(cycle_id))
+    os.makedirs(mutation_root, exist_ok=True)
+
+    _log(
+        "mutation_config "
+        f"enabled=1 k_candidates={k_candidates} mutation_seed={seed} mutation_profile={profile}"
+    )
+    logger.info(
+        event="mutation_candidates_generated",
+        stage="candidate_generate",
+        cycle_id=cycle_id,
+        approved_hash=approved_hash,
+        candidate_hash="pending",
+        score_total=None,
+        gate_status="PENDING",
+        k_candidates=int(k_candidates),
+        mutation_seed=int(seed),
+        mutation_profile=profile,
+    )
+
+    candidates: List[MutationCandidate] = []
+    seen_candidate_hashes: set[str] = set()
+    for idx in range(int(k_candidates)):
+        candidate_dir = os.path.join(mutation_root, f"candidate_{idx}")
+        candidate_path = os.path.join(candidate_dir, "meta_risk_state.json")
+        candidate_manifest = os.path.join(candidate_dir, "manifest.json")
+        shadow_out_json = os.path.join(candidate_dir, "shadow_replay_report.json")
+        eval_report_path = os.path.join(candidate_dir, "promotion_eval.json")
+        mode = "copy" if idx == 0 else "safe_mutate"
+        candidate_hash = "missing"
+        param_diff_summary: List[str] = ["BASE"]
+        attempts = 0
+        while True:
+            candidate_seed = int(rng.randint(0, 2**31 - 1))
+            step = _run_module(
+                f"candidate_generate_c{idx}",
+                "scripts.meta_candidate_generate",
+                [
+                    "--approved_state_path",
+                    paths.approved_state_path,
+                    "--candidate_out_path",
+                    candidate_path,
+                    "--candidate_manifest",
+                    candidate_manifest,
+                    "--reason",
+                    args.reason,
+                    "--strict",
+                    str(int(args.strict)),
+                    "--mode",
+                    mode,
+                    "--seed",
+                    str(candidate_seed),
+                    "--candidate_index",
+                    str(int(idx)),
+                    "--mutation_profile",
+                    profile,
+                ],
+                logger=logger,
+                cycle_id=cycle_id,
+            )
+            if step.return_code != EXIT_OK:
+                raise RuntimeError(f"mutation_candidate_generate_failed index={idx} rc={step.return_code}")
+            candidate_hash = _load_candidate_hash(candidate_manifest, candidate_path)
+            param_diff_summary = _manifest_param_diff_summary(candidate_manifest)
+            if idx == 0 or candidate_hash not in seen_candidate_hashes or attempts >= 4:
+                break
+            attempts += 1
+            _log(
+                "mutation_candidate_regenerate "
+                f"index={idx} duplicate_hash={candidate_hash} attempt={attempts}"
+            )
+
+        seen_candidate_hashes.add(candidate_hash)
+        _log(
+            "mutation_candidate_generated "
+            f"index={idx} candidate_hash={candidate_hash} "
+            f"param_diff_summary={'|'.join(param_diff_summary)}"
+        )
+        logger.info(
+            event="mutation_candidates_generated",
+            stage="candidate_generate",
+            cycle_id=cycle_id,
+            approved_hash=approved_hash,
+            candidate_hash=candidate_hash,
+            score_total=None,
+            gate_status="PENDING",
+            candidate_index=int(idx),
+        )
+        candidates.append(
+            MutationCandidate(
+                index=int(idx),
+                candidate_path=candidate_path,
+                candidate_manifest_path=candidate_manifest,
+                shadow_out_json=shadow_out_json,
+                eval_report_path=eval_report_path,
+                candidate_hash=candidate_hash,
+                param_diff_summary=param_diff_summary,
+                gate_status="PENDING",
+                gate_reason="pending",
+                score_total=None,
+                score_holdout=None,
+            )
+        )
+
+    for candidate in candidates:
+        replay_stage = _run_module(
+            f"shadow_replay_c{candidate.index}",
+            "scripts.shadow_replay",
+            [
+                "--csv",
+                args.csv,
+                "--meta_state_path",
+                candidate.candidate_path,
+                "--out_json",
+                candidate.shadow_out_json,
+                "--strict",
+                str(int(args.strict)),
+                "--deterministic_check",
+                "1",
+                "--cycle_id",
+                cycle_id,
+            ],
+            logger=logger,
+            cycle_id=cycle_id,
+        )
+        if replay_stage.return_code != EXIT_OK:
+            candidate.gate_status = "FAIL"
+            candidate.gate_reason = f"shadow_replay_failed rc={replay_stage.return_code}"
+            candidate.score_total = None
+            candidate.score_holdout = None
+            _log(
+                "mutation_candidate_evaluated "
+                f"index={candidate.index} candidate_hash={candidate.candidate_hash} "
+                f"gate_status={candidate.gate_status} gate_reason={candidate.gate_reason}"
+            )
+            logger.info(
+                event="mutation_candidate_evaluated",
+                stage="meta_promote_eval",
+                cycle_id=cycle_id,
+                approved_hash=approved_hash,
+                candidate_hash=candidate.candidate_hash,
+                score_total=None,
+                gate_status=candidate.gate_status,
+            )
+            continue
+
+        eval_cli = [
+            "--candidate_path",
+            candidate.candidate_path,
+            "--reason",
+            args.reason,
+            "--strict",
+            str(int(args.strict)),
+            "--csv",
+            args.csv,
+            "--no_exit_on_reject",
+            "1",
+            "--enable_scoring",
+            "1",
+            "--w_pnl",
+            str(float(args.w_pnl)),
+            "--w_win",
+            str(float(args.w_win)),
+            "--w_dd",
+            str(float(args.w_dd)),
+            "--cycle_id",
+            cycle_id,
+            "--eval_only",
+            "1",
+            "--eval_report_path",
+            candidate.eval_report_path,
+            "--holdout_report_path",
+            os.path.join("data", "reports", "holdout", "holdout_report.json"),
+        ]
+        if dry_run:
+            eval_cli.extend(
+                [
+                    "--approved_dir",
+                    paths.promote_approved_dir,
+                ]
+            )
+
+        eval_stage = _run_module(
+            f"meta_promote_eval_c{candidate.index}",
+            "scripts.meta_promote",
+            eval_cli,
+            logger=logger,
+            cycle_id=cycle_id,
+        )
+        if eval_stage.return_code >= ExitCode.DATA_INVALID or eval_stage.return_code == EXIT_ERROR:
+            raise RuntimeError(f"mutation_eval_failed index={candidate.index} rc={eval_stage.return_code}")
+
+        eval_payload = _load_json_dict(candidate.eval_report_path)
+        if not eval_payload:
+            raise RuntimeError(f"mutation_eval_report_missing index={candidate.index} path={candidate.eval_report_path}")
+
+        candidate.gate_status = str(eval_payload.get("gate_status", "FAIL")).strip().upper() or "FAIL"
+        candidate.gate_reason = str(eval_payload.get("gate_reason", "missing")).strip() or "missing"
+        candidate.score_total = _safe_float_or_none(eval_payload.get("score_total"))
+        candidate.score_holdout = _safe_float_or_none(eval_payload.get("score_holdout"))
+        _log(
+            "mutation_candidate_evaluated "
+            f"index={candidate.index} candidate_hash={candidate.candidate_hash} "
+            f"gate_status={candidate.gate_status} score_total={candidate.score_total}"
+        )
+        logger.info(
+            event="mutation_candidate_evaluated",
+            stage="meta_promote_eval",
+            cycle_id=cycle_id,
+            approved_hash=approved_hash,
+            candidate_hash=candidate.candidate_hash,
+            score_total=_round8_or_none(candidate.score_total),
+            gate_status=candidate.gate_status,
+        )
+
+    selected: Optional[MutationCandidate] = None
+    best_score: Optional[float] = None
+    pass_count = 0
+    for candidate in candidates:
+        if candidate.gate_status != "PASS":
+            continue
+        pass_count += 1
+        score = candidate.score_total
+        if selected is None:
+            selected = candidate
+            best_score = score
+            continue
+        if score is None:
+            continue
+        if best_score is None or float(score) > float(best_score):
+            selected = candidate
+            best_score = float(score)
+
+    if selected is None:
+        selection_reason = "no_pass_candidates"
+        selected_hash = None
+        selection_score = None
+        selection_gate = "REJECT"
+    else:
+        selected_hash = selected.candidate_hash
+        selection_score = _round8_or_none(best_score)
+        selection_gate = "PASS"
+        if best_score is None:
+            selection_reason = f"pass_without_score_fallback candidate_index={selected.index}"
+        else:
+            selection_reason = (
+                f"best_score_total={_round8_or_none(best_score)} "
+                f"candidate_index={selected.index} pass_count={pass_count}"
+            )
+
+    logger.info(
+        event="mutation_selection",
+        stage="meta_promote_eval",
+        cycle_id=cycle_id,
+        approved_hash=approved_hash,
+        candidate_hash=selected_hash or "missing",
+        score_total=selection_score,
+        gate_status=selection_gate,
+    )
+    _log(
+        "mutation_selection "
+        f"selected_candidate_hash={selected_hash or 'missing'} "
+        f"selection_reason={selection_reason}"
+    )
+
+    ledger_candidates: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        item: Dict[str, Any] = {
+            "candidate_hash": candidate.candidate_hash,
+            "param_diff_summary": list(candidate.param_diff_summary),
+            "gate_status": candidate.gate_status,
+            "gate_reason": candidate.gate_reason,
+            "score_total": _round8_or_none(candidate.score_total),
+        }
+        if candidate.score_holdout is not None:
+            item["score_holdout"] = _round8_or_none(candidate.score_holdout)
+        ledger_candidates.append(item)
+
+    ledger_extra = {
+        "mutation_enabled": 1,
+        "k_candidates": int(k_candidates),
+        "mutation_seed": int(seed),
+        "mutation_seed_basis": seed_basis,
+        "mutation_profile": profile,
+        "candidates": ledger_candidates,
+        "selected_candidate_hash": selected_hash,
+        "selection_reason": selection_reason,
+    }
+    ledger_extra_path = os.path.join(mutation_root, "mutation_ledger_extra.json")
+    atomic_io.atomic_write_json(
+        ledger_extra_path,
+        ledger_extra,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    )
+
+    return MutationSelection(
+        candidates=candidates,
+        selected=selected,
+        k_candidates=int(k_candidates),
+        mutation_seed=int(seed),
+        mutation_seed_basis=seed_basis,
+        mutation_profile=profile,
+        selection_reason=selection_reason,
+        ledger_extra_path=ledger_extra_path,
+    )
+
+
 def _utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -498,6 +947,7 @@ def _run_cycle(
     strict = int(args.strict) == 1
     skip_replay = int(args.skip_replay) == 1
     skip_promote = int(args.skip_promote) == 1
+    opt_mutation = int(getattr(args, "opt_mutation", 0)) == 1
 
     t_total = time.perf_counter()
     candidate_hash = "missing"
@@ -519,75 +969,35 @@ def _run_cycle(
             cycle_status = "FAIL"
             return _finish(EXIT_ERROR)
 
-        # Step 1: candidate generation
-        step1 = _run_module(
-            "candidate_generate",
-            "scripts.meta_candidate_generate",
-            [
-                "--approved_state_path",
-                paths.approved_state_path,
-                "--candidate_out_path",
-                paths.candidate_path,
-                "--candidate_manifest",
-                paths.candidate_manifest_path,
-                "--reason",
-                args.reason,
-                "--strict",
-                str(int(args.strict)),
-            ],
-            logger=logger,
-            cycle_id=cycle_id,
-        )
-        if step1.return_code == EXIT_ERROR:
-            cycle_status = "FAIL"
-            return _finish(EXIT_ERROR)
-        if step1.return_code != EXIT_OK:
-            cycle_status = "FAIL"
-            return _finish(EXIT_ERROR)
+        if opt_mutation and (skip_replay or skip_promote):
+            _log("opt_mutation_disabled reason=skip_replay_or_skip_promote")
+            logger.warn(
+                event="mutation_disabled",
+                stage="meta_cycle",
+                cycle_id=cycle_id,
+                reason="skip_replay_or_skip_promote",
+            )
+            opt_mutation = False
 
-        candidate_hash = _load_candidate_hash(paths.candidate_manifest_path, paths.candidate_path)
-
-        # Step 2: shadow replay
-        if skip_replay:
-            _log("stage=shadow_replay skipped=1")
-            logger.info(event="stage_skip", stage="shadow_replay", cycle_id=cycle_id, skipped=1)
-        else:
-            step2 = _run_module(
-                "shadow_replay",
-                "scripts.shadow_replay",
-                [
-                    "--csv",
-                    args.csv,
-                    "--meta_state_path",
-                    paths.candidate_path,
-                    "--out_json",
-                    paths.shadow_out_json,
-                    "--strict",
-                    str(int(args.strict)),
-                    "--deterministic_check",
-                    "1",
-                    "--cycle_id",
-                    cycle_id,
-                ],
+        if opt_mutation:
+            approved_hash = _sha256_file(paths.approved_state_path)
+            mutation_selection = _run_mutation_selection(
+                args=args,
+                paths=paths,
+                dry_run=dry_run,
                 logger=logger,
                 cycle_id=cycle_id,
+                approved_hash=approved_hash,
             )
-            if step2.return_code == EXIT_ERROR:
-                cycle_status = "FAIL"
-                return _finish(EXIT_ERROR)
-            if step2.return_code != EXIT_OK:
+            if not mutation_selection.candidates:
                 cycle_status = "FAIL"
                 return _finish(EXIT_ERROR)
 
-        # Step 3: promotion gate
-        if skip_promote:
-            decision = "SKIPPED"
-            _log("stage=meta_promote skipped=1")
-            logger.info(event="stage_skip", stage="meta_promote", cycle_id=cycle_id, skipped=1)
-        else:
+            final_candidate = mutation_selection.selected or mutation_selection.candidates[0]
+            candidate_hash = final_candidate.candidate_hash
             promote_cli = [
                 "--candidate_path",
-                paths.candidate_path,
+                final_candidate.candidate_path,
                 "--reason",
                 args.reason,
                 "--strict",
@@ -595,7 +1005,7 @@ def _run_cycle(
                 "--csv",
                 args.csv,
                 "--no_exit_on_reject",
-                "1" if dry_run else str(int(args.no_exit_on_reject)),
+                "1",
                 "--enable_scoring",
                 str(int(args.enable_scoring)),
                 "--w_pnl",
@@ -606,6 +1016,8 @@ def _run_cycle(
                 str(float(args.w_dd)),
                 "--cycle_id",
                 cycle_id,
+                "--ledger_extra_path",
+                mutation_selection.ledger_extra_path,
             ]
             if dry_run:
                 promote_cli.extend(
@@ -647,8 +1059,6 @@ def _run_cycle(
             elif promote_status == "FAIL":
                 decision = "ERROR"
             elif step3.return_code == EXIT_OK:
-                # meta_promote can return 0 on reject when no_exit_on_reject=1; fallback is optimistic only
-                # when no explicit status can be parsed.
                 decision = "APPROVED"
             else:
                 decision = "ERROR"
@@ -657,15 +1067,158 @@ def _run_cycle(
                 cycle_status = "FAIL"
                 return _finish(EXIT_ERROR)
 
-            if strict and not dry_run and decision == "REJECTED":
-                _log("strict_reject=1 -> stop_before_post_validation")
+            if decision == "REJECTED":
+                _log("mutation_business_reject=1 -> stop_before_post_validation")
                 cycle_status = "SUCCESS_WITH_REJECT"
-                return _finish(EXIT_REJECT)
+                return _finish(EXIT_OK)
+        else:
+            # Step 1: candidate generation
+            step1 = _run_module(
+                "candidate_generate",
+                "scripts.meta_candidate_generate",
+                [
+                    "--approved_state_path",
+                    paths.approved_state_path,
+                    "--candidate_out_path",
+                    paths.candidate_path,
+                    "--candidate_manifest",
+                    paths.candidate_manifest_path,
+                    "--reason",
+                    args.reason,
+                    "--strict",
+                    str(int(args.strict)),
+                ],
+                logger=logger,
+                cycle_id=cycle_id,
+            )
+            if step1.return_code == EXIT_ERROR:
+                cycle_status = "FAIL"
+                return _finish(EXIT_ERROR)
+            if step1.return_code != EXIT_OK:
+                cycle_status = "FAIL"
+                return _finish(EXIT_ERROR)
 
-            if decision == "REJECTED" and not strict:
-                _log("non_strict_reject_allowed=1 -> continue")
-            if decision == "REJECTED" and dry_run:
-                _log("dry_run_reject_simulated=1 -> continue")
+            candidate_hash = _load_candidate_hash(paths.candidate_manifest_path, paths.candidate_path)
+
+            # Step 2: shadow replay
+            if skip_replay:
+                _log("stage=shadow_replay skipped=1")
+                logger.info(event="stage_skip", stage="shadow_replay", cycle_id=cycle_id, skipped=1)
+            else:
+                step2 = _run_module(
+                    "shadow_replay",
+                    "scripts.shadow_replay",
+                    [
+                        "--csv",
+                        args.csv,
+                        "--meta_state_path",
+                        paths.candidate_path,
+                        "--out_json",
+                        paths.shadow_out_json,
+                        "--strict",
+                        str(int(args.strict)),
+                        "--deterministic_check",
+                        "1",
+                        "--cycle_id",
+                        cycle_id,
+                    ],
+                    logger=logger,
+                    cycle_id=cycle_id,
+                )
+                if step2.return_code == EXIT_ERROR:
+                    cycle_status = "FAIL"
+                    return _finish(EXIT_ERROR)
+                if step2.return_code != EXIT_OK:
+                    cycle_status = "FAIL"
+                    return _finish(EXIT_ERROR)
+
+            # Step 3: promotion gate
+            if skip_promote:
+                decision = "SKIPPED"
+                _log("stage=meta_promote skipped=1")
+                logger.info(event="stage_skip", stage="meta_promote", cycle_id=cycle_id, skipped=1)
+            else:
+                promote_cli = [
+                    "--candidate_path",
+                    paths.candidate_path,
+                    "--reason",
+                    args.reason,
+                    "--strict",
+                    str(int(args.strict)),
+                    "--csv",
+                    args.csv,
+                    "--no_exit_on_reject",
+                    "1" if dry_run else str(int(args.no_exit_on_reject)),
+                    "--enable_scoring",
+                    str(int(args.enable_scoring)),
+                    "--w_pnl",
+                    str(float(args.w_pnl)),
+                    "--w_win",
+                    str(float(args.w_win)),
+                    "--w_dd",
+                    str(float(args.w_dd)),
+                    "--cycle_id",
+                    cycle_id,
+                ]
+                if dry_run:
+                    promote_cli.extend(
+                        [
+                            "--approved_dir",
+                            paths.promote_approved_dir,
+                            "--history_dir",
+                            paths.promote_history_dir,
+                            "--rejected_dir",
+                            paths.promote_rejected_dir,
+                            "--ledger_path",
+                            paths.promote_ledger_path,
+                        ]
+                    )
+                step3 = _run_module(
+                    "meta_promote",
+                    "scripts.meta_promote",
+                    promote_cli,
+                    logger=logger,
+                    cycle_id=cycle_id,
+                )
+                if step3.return_code >= ExitCode.DATA_INVALID:
+                    cycle_status = "FAIL"
+                    return _finish(int(step3.return_code))
+                if step3.return_code == EXIT_ERROR:
+                    cycle_status = "FAIL"
+                    return _finish(EXIT_ERROR)
+
+                promote_status, promote_hash, promote_ledger_path = _parse_promotion_stage(step3)
+                if _is_sha256(promote_hash):
+                    candidate_hash = promote_hash
+                if promote_ledger_path:
+                    ledger_path = promote_ledger_path
+
+                if promote_status == "REJECT" or step3.return_code == EXIT_REJECT:
+                    decision = "REJECTED"
+                elif promote_status == "PASS":
+                    decision = "APPROVED"
+                elif promote_status == "FAIL":
+                    decision = "ERROR"
+                elif step3.return_code == EXIT_OK:
+                    # meta_promote can return 0 on reject when no_exit_on_reject=1; fallback is optimistic only
+                    # when no explicit status can be parsed.
+                    decision = "APPROVED"
+                else:
+                    decision = "ERROR"
+
+                if decision == "ERROR":
+                    cycle_status = "FAIL"
+                    return _finish(EXIT_ERROR)
+
+                if strict and not dry_run and decision == "REJECTED":
+                    _log("strict_reject=1 -> stop_before_post_validation")
+                    cycle_status = "SUCCESS_WITH_REJECT"
+                    return _finish(EXIT_REJECT)
+
+                if decision == "REJECTED" and not strict:
+                    _log("non_strict_reject_allowed=1 -> continue")
+                if decision == "REJECTED" and dry_run:
+                    _log("dry_run_reject_simulated=1 -> continue")
 
         # Step 4: post-validation
         det_cli = [
@@ -893,6 +1446,10 @@ def main() -> int:
         enable_anomaly_guard=int(args.enable_anomaly_guard),
         auto_rollback=int(args.auto_rollback),
         simulate_anomaly=int(args.simulate_anomaly),
+        opt_mutation=int(getattr(args, "opt_mutation", 0)),
+        k_candidates=int(_clamp_k_candidates(getattr(args, "k_candidates", _MUTATION_K_DEFAULT))),
+        mutation_profile=str(getattr(args, "mutation_profile", "safe")),
+        mutation_seed=str(getattr(args, "mutation_seed", "") or ""),
     )
     dry_run = int(args.dry_run) == 1
     skip_global_lock = int(args.skip_global_lock) == 1
