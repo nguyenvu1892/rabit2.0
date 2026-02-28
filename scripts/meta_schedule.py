@@ -76,6 +76,51 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--strict", type=int, choices=[0, 1], default=1, help="Strict mode (0/1).")
     ap.add_argument("--dry_run", type=int, choices=[0, 1], default=0, help="Dry-run mode (0/1).")
     ap.add_argument(
+        "--enable_anomaly_guard",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Pass-through to meta_cycle anomaly guard (0/1).",
+    )
+    ap.add_argument(
+        "--auto_rollback",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Pass-through to meta_cycle anomaly auto rollback (0/1).",
+    )
+    ap.add_argument(
+        "--daily_dd_limit",
+        type=float,
+        default=0.15,
+        help="Pass-through anomaly threshold for |daily_drawdown_pct|.",
+    )
+    ap.add_argument(
+        "--pnl_jump_abs_limit",
+        type=float,
+        default=100.0,
+        help="Pass-through anomaly threshold for |current_total_pnl - previous_total_pnl|.",
+    )
+    ap.add_argument(
+        "--trades_spike_limit",
+        type=int,
+        default=2000,
+        help="Pass-through anomaly threshold for trades_today.",
+    )
+    ap.add_argument(
+        "--equity_drift_abs_limit",
+        type=float,
+        default=5.0,
+        help="Pass-through anomaly threshold for |summary_equity - equity_csv_last|.",
+    )
+    ap.add_argument(
+        "--simulate_anomaly",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Pass-through to force anomaly detection in meta_cycle (0/1).",
+    )
+    ap.add_argument(
         "--interval_minutes",
         type=float,
         default=None,
@@ -182,6 +227,8 @@ def _scheduler_status_from_return_code(return_code: int) -> str:
         return "OK"
     if rc == ExitCode.BUSINESS_SKIP:
         return "RETRYABLE"
+    if rc == ExitCode.ANOMALY_HALT:
+        return "ANOMALY_HALT"
     return "ERROR"
 
 
@@ -238,6 +285,13 @@ def _run_cycle(
     reason: str,
     strict: int,
     dry_run: int,
+    enable_anomaly_guard: int,
+    auto_rollback: int,
+    daily_dd_limit: float,
+    pnl_jump_abs_limit: float,
+    trades_spike_limit: int,
+    equity_drift_abs_limit: float,
+    simulate_anomaly: int,
     *,
     cycle_id: str,
     logger: StructuredLogger,
@@ -254,6 +308,20 @@ def _run_cycle(
         str(int(strict)),
         "--dry_run",
         str(int(dry_run)),
+        "--enable_anomaly_guard",
+        str(int(enable_anomaly_guard)),
+        "--auto_rollback",
+        str(int(auto_rollback)),
+        "--daily_dd_limit",
+        str(float(daily_dd_limit)),
+        "--pnl_jump_abs_limit",
+        str(float(pnl_jump_abs_limit)),
+        "--trades_spike_limit",
+        str(int(trades_spike_limit)),
+        "--equity_drift_abs_limit",
+        str(float(equity_drift_abs_limit)),
+        "--simulate_anomaly",
+        str(int(simulate_anomaly)),
         "--skip_global_lock",
         "1",
         "--cycle_id",
@@ -486,6 +554,13 @@ def _run_once(args: argparse.Namespace, lock_ttl_sec: float, *, logger: Structur
             reason=args.reason,
             strict=int(args.strict),
             dry_run=int(args.dry_run),
+            enable_anomaly_guard=int(args.enable_anomaly_guard),
+            auto_rollback=int(args.auto_rollback),
+            daily_dd_limit=float(args.daily_dd_limit),
+            pnl_jump_abs_limit=float(args.pnl_jump_abs_limit),
+            trades_spike_limit=int(args.trades_spike_limit),
+            equity_drift_abs_limit=float(args.equity_drift_abs_limit),
+            simulate_anomaly=int(args.simulate_anomaly),
             cycle_id=cycle_id,
             logger=logger,
         )
@@ -603,6 +678,13 @@ def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float, *, logger:
                 reason=cycle_reason,
                 strict=int(args.strict),
                 dry_run=int(args.dry_run),
+                enable_anomaly_guard=int(args.enable_anomaly_guard),
+                auto_rollback=int(args.auto_rollback),
+                daily_dd_limit=float(args.daily_dd_limit),
+                pnl_jump_abs_limit=float(args.pnl_jump_abs_limit),
+                trades_spike_limit=int(args.trades_spike_limit),
+                equity_drift_abs_limit=float(args.equity_drift_abs_limit),
+                simulate_anomaly=int(args.simulate_anomaly),
                 cycle_id=cycle_id,
                 logger=logger,
             )
@@ -653,7 +735,9 @@ def main() -> int:
     _log(
         f"start mode={mode} csv={args.csv} reason={args.reason} strict={int(args.strict)} "
         f"dry_run={int(args.dry_run)} lock_path={args.lock_path} lock_ttl_sec={lock_ttl_sec:.3f} "
-        f"force_lock_break={int(args.force_lock_break)} on_lock_held={args.on_lock_held}"
+        f"force_lock_break={int(args.force_lock_break)} on_lock_held={args.on_lock_held} "
+        f"enable_anomaly_guard={int(args.enable_anomaly_guard)} auto_rollback={int(args.auto_rollback)} "
+        f"simulate_anomaly={int(args.simulate_anomaly)}"
     )
     logger.info(
         event="stage_start",
@@ -664,6 +748,9 @@ def main() -> int:
         reason=str(args.reason),
         strict=int(args.strict),
         dry_run=int(args.dry_run),
+        enable_anomaly_guard=int(args.enable_anomaly_guard),
+        auto_rollback=int(args.auto_rollback),
+        simulate_anomaly=int(args.simulate_anomaly),
         lock_path=args.lock_path,
     )
 

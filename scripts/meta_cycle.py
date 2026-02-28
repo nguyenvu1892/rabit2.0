@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import os
 import re
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from rabit.state import atomic_io
+from rabit.state.anomaly_guardrail import detect_anomaly
 from rabit.state.exit_codes import ExitCode
 from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
 from rabit.utils import StructuredLogger, generate_cycle_id, get_logger
@@ -23,6 +25,7 @@ EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
 EXIT_LOCK_RETRYABLE = ExitCode.BUSINESS_SKIP
 EXIT_ERROR = ExitCode.INTERNAL_ERROR
+EXIT_ANOMALY_HALT = ExitCode.ANOMALY_HALT
 
 DEFAULT_APPROVED_STATE_PATH = os.path.join("data", "meta_states", "current_approved", "meta_risk_state.json")
 DEFAULT_CANDIDATE_PATH = os.path.join("data", "meta_states", "candidate", "meta_risk_state.json")
@@ -30,6 +33,7 @@ DEFAULT_CANDIDATE_MANIFEST = os.path.join("data", "meta_states", "candidate", "m
 DEFAULT_SHADOW_REPORT = os.path.join("data", "reports", "shadow_replay_report.json")
 DEFAULT_LEDGER_PATH = os.path.join("data", "meta_states", "ledger.jsonl")
 DEFAULT_HEALTH_OUT_DIR = os.path.join("data", "reports", "meta_cycle_healthcheck")
+DEFAULT_INCIDENT_DIR = os.path.join("data", "reports", "incidents")
 DEFAULT_LOCK_PATH = os.path.join("data", "meta_states", ".locks", "meta_cycle.lock")
 
 _PROMOTION_STATUS_RE = re.compile(r"\[promotion\]\s+STATUS=([A-Z]+)")
@@ -117,6 +121,51 @@ def _parse_args() -> argparse.Namespace:
         choices=[0, 1],
         default=0,
         help="Pass-through to meta_promote (0/1)",
+    )
+    ap.add_argument(
+        "--enable_anomaly_guard",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Enable anomaly guardrail between meta_promote and healthcheck (0/1)",
+    )
+    ap.add_argument(
+        "--auto_rollback",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="On anomaly, auto-run rollback --steps 1 in protected mode (0/1)",
+    )
+    ap.add_argument(
+        "--daily_dd_limit",
+        type=float,
+        default=0.15,
+        help="Anomaly threshold for |daily_drawdown_pct| (default: 0.15)",
+    )
+    ap.add_argument(
+        "--pnl_jump_abs_limit",
+        type=float,
+        default=100.0,
+        help="Anomaly threshold for |current_total_pnl - previous_total_pnl| (default: 100)",
+    )
+    ap.add_argument(
+        "--trades_spike_limit",
+        type=int,
+        default=2000,
+        help="Anomaly threshold for trades_today (default: 2000)",
+    )
+    ap.add_argument(
+        "--equity_drift_abs_limit",
+        type=float,
+        default=5.0,
+        help="Anomaly threshold for |summary_equity - equity_csv_last| (default: 5)",
+    )
+    ap.add_argument(
+        "--simulate_anomaly",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Force anomaly guardrail detection for test validation (0/1)",
     )
     ap.add_argument("--skip_replay", type=int, choices=[0, 1], default=0, help="Skip shadow replay step")
     ap.add_argument("--skip_promote", type=int, choices=[0, 1], default=0, help="Skip promotion gate step")
@@ -339,6 +388,70 @@ def _append_optional_risk_args(cli: List[str], args: argparse.Namespace) -> None
         cli.extend(["--risk_per_trade", str(float(args.risk_per_trade))])
     if args.account_equity_start is not None:
         cli.extend(["--account_equity_start", str(float(args.account_equity_start))])
+
+
+def _utc_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_incident_report(
+    *,
+    cycle_id: str,
+    reason_code: str,
+    metrics_snapshot: dict,
+    incident_dir: str = DEFAULT_INCIDENT_DIR,
+) -> str:
+    path = os.path.join(incident_dir, f"{cycle_id}.json")
+    payload = {
+        "ts_utc": _utc_iso(),
+        "cycle_id": str(cycle_id),
+        "reason_code": str(reason_code),
+        "metrics_snapshot": dict(metrics_snapshot or {}),
+    }
+    atomic_io.atomic_write_json(path, payload, ensure_ascii=False, sort_keys=True, indent=2)
+    return path
+
+
+def _run_auto_rollback_protected(
+    *,
+    logger: StructuredLogger,
+    cycle_id: str,
+    reason_code: str,
+) -> None:
+    rollback_reason = f"anomaly_auto_rollback cycle_id={cycle_id} reason_code={reason_code}"
+    try:
+        rollback_stage = _run_module(
+            "anomaly_auto_rollback",
+            "scripts.meta_rollback",
+            [
+                "--steps",
+                "1",
+                "--reason",
+                rollback_reason,
+                "--strict",
+                "1",
+                "--dry_run",
+                "0",
+            ],
+            logger=logger,
+            cycle_id=cycle_id,
+        )
+        logger.info(
+            event="anomaly_auto_rollback_result",
+            stage="anomaly_guardrail",
+            cycle_id=cycle_id,
+            rollback_rc=int(rollback_stage.return_code),
+            reason_code=str(reason_code),
+        )
+    except Exception as exc:
+        logger.error(
+            event="anomaly_auto_rollback_exception",
+            stage="anomaly_guardrail",
+            cycle_id=cycle_id,
+            reason_code=str(reason_code),
+            exc_type=type(exc).__name__,
+            message=str(exc),
+        )
 
 
 def _print_final_summary(
@@ -599,6 +712,71 @@ def _run_cycle(
             cycle_status = "FAIL"
             return _finish(EXIT_ERROR)
 
+        enable_anomaly_guard = int(args.enable_anomaly_guard) == 1
+        if enable_anomaly_guard:
+            summary_path = os.path.join(paths.health_out_dir, "live_daily_summary.json")
+            equity_path = os.path.join(paths.health_out_dir, "live_daily_equity.csv")
+            regime_path = os.path.join(paths.health_out_dir, "live_daily_regime.json")
+            anomaly_payload = detect_anomaly(
+                {
+                    "summary_path": summary_path,
+                    "equity_path": equity_path,
+                    "regime_path": regime_path,
+                    "daily_dd_limit": float(args.daily_dd_limit),
+                    "pnl_jump_abs_limit": float(args.pnl_jump_abs_limit),
+                    "trades_spike_limit": int(args.trades_spike_limit),
+                    "equity_drift_abs_limit": float(args.equity_drift_abs_limit),
+                    "simulate_anomaly": int(args.simulate_anomaly),
+                }
+            )
+            is_anomaly = bool(anomaly_payload.get("is_anomaly", False))
+            if is_anomaly:
+                reason_code = str(anomaly_payload.get("reason_code", "UNKNOWN_ANOMALY"))
+                metrics_snapshot = anomaly_payload.get("metrics", {})
+                incident_path = _write_incident_report(
+                    cycle_id=cycle_id,
+                    reason_code=reason_code,
+                    metrics_snapshot=metrics_snapshot if isinstance(metrics_snapshot, dict) else {},
+                )
+                _log(f"event=anomaly_detected reason_code={reason_code} incident_path={incident_path}")
+                logger.warn(
+                    event="anomaly_detected",
+                    stage="anomaly_guardrail",
+                    cycle_id=cycle_id,
+                    reason_code=reason_code,
+                    metrics_snapshot=metrics_snapshot,
+                    incident_path=incident_path,
+                )
+
+                if int(args.auto_rollback) == 1:
+                    if dry_run:
+                        logger.info(
+                            event="anomaly_auto_rollback_skip",
+                            stage="anomaly_guardrail",
+                            cycle_id=cycle_id,
+                            reason="dry_run=1",
+                            reason_code=reason_code,
+                        )
+                    else:
+                        _run_auto_rollback_protected(
+                            logger=logger,
+                            cycle_id=cycle_id,
+                            reason_code=reason_code,
+                        )
+
+                healthcheck_status = "SKIPPED"
+                cycle_status = "HALT_ANOMALY"
+                return _finish(EXIT_ANOMALY_HALT)
+            logger.info(
+                event="anomaly_guardrail_pass",
+                stage="anomaly_guardrail",
+                cycle_id=cycle_id,
+                reason_code=str(anomaly_payload.get("reason_code", "NONE")),
+            )
+        else:
+            _log("stage=anomaly_guardrail skipped=1")
+            logger.info(event="stage_skip", stage="anomaly_guardrail", cycle_id=cycle_id, skipped=1)
+
         health_stage = _run_module(
             "healthcheck",
             "scripts.meta_healthcheck",
@@ -690,6 +868,9 @@ def main() -> int:
         reason=str(args.reason),
         strict=int(args.strict),
         dry_run=int(args.dry_run),
+        enable_anomaly_guard=int(args.enable_anomaly_guard),
+        auto_rollback=int(args.auto_rollback),
+        simulate_anomaly=int(args.simulate_anomaly),
     )
     dry_run = int(args.dry_run) == 1
     skip_global_lock = int(args.skip_global_lock) == 1

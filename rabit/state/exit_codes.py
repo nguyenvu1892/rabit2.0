@@ -9,3 +9,4 @@ class ExitCode:
     STATE_CORRUPT = 30
     LOCK_TIMEOUT = 40
     INTERNAL_ERROR = 50
+    ANOMALY_HALT = 60
