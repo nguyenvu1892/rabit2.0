@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts import _deterministic as detx
@@ -13,6 +14,7 @@ from rabit.rl.regime_perf_feedback import RegimePerfConfig, RegimePerfFeedbackEn
 from rabit.meta import perf_history
 from rabit.state import atomic_io
 from rabit.state import versioned_state as vstate
+from rabit.utils import get_logger
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -27,6 +29,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--strict", type=int, default=1)
     ap.add_argument("--deterministic_check", type=int, default=1)
     ap.add_argument("--debug", type=int, default=0)
+    ap.add_argument("--cycle_id", default="")
     return ap
 
 
@@ -577,83 +580,130 @@ def _write_report(path: str, report: Dict[str, Any]) -> None:
 def main() -> None:
     ap = _build_arg_parser()
     cli_args = ap.parse_args()
-
-    strict = _parse_bool_flag(cli_args.strict, default=True)
-    deterministic_enabled = _parse_bool_flag(cli_args.deterministic_check, default=True)
-    debug_enabled = _parse_bool_flag(cli_args.debug, default=False)
-
-    args = _merge_live_defaults(cli_args)
-
-    report: Optional[Dict[str, Any]] = None
-    snapshot1: Optional[Dict[str, Any]] = None
-    snapshot2: Optional[Dict[str, Any]] = None
-    reasons: List[str] = []
+    cycle_id = str(getattr(cli_args, "cycle_id", "") or "").strip()
+    logger = get_logger("shadow_replay").bind(cycle_id=cycle_id)
+    logger.info(
+        event="stage_start",
+        stage="shadow_replay",
+        cycle_id=cycle_id,
+        csv=cli_args.csv,
+        strict=int(cli_args.strict),
+        deterministic_check=int(cli_args.deterministic_check),
+    )
+    t0 = time.perf_counter()
+    rc = 0
 
     try:
-        if deterministic_enabled:
-            report1, snapshot1 = _run_shadow_replay_once(
-                args,
-                debug_enabled=debug_enabled,
-                deterministic_enabled=True,
-                read_only_state=True,
+        strict = _parse_bool_flag(cli_args.strict, default=True)
+        deterministic_enabled = _parse_bool_flag(cli_args.deterministic_check, default=True)
+        debug_enabled = _parse_bool_flag(cli_args.debug, default=False)
+
+        args = _merge_live_defaults(cli_args)
+
+        report: Optional[Dict[str, Any]] = None
+        snapshot1: Optional[Dict[str, Any]] = None
+        snapshot2: Optional[Dict[str, Any]] = None
+        reasons: List[str] = []
+
+        try:
+            if deterministic_enabled:
+                report1, snapshot1 = _run_shadow_replay_once(
+                    args,
+                    debug_enabled=debug_enabled,
+                    deterministic_enabled=True,
+                    read_only_state=True,
+                )
+                report = report1
+                report2, snapshot2 = _run_shadow_replay_once(
+                    args,
+                    debug_enabled=debug_enabled,
+                    deterministic_enabled=True,
+                    read_only_state=True,
+                )
+                try:
+                    detx.compare_deterministic_snapshots(snapshot1, snapshot2)
+                except Exception as exc:
+                    logger.error(
+                        event="exception",
+                        stage="shadow_replay",
+                        cycle_id=cycle_id,
+                        exc_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                    reasons.append(f"deterministic_check_failed: {exc}")
+            else:
+                report, _ = _run_shadow_replay_once(
+                    args,
+                    debug_enabled=debug_enabled,
+                    deterministic_enabled=False,
+                    read_only_state=True,
+                )
+        except Exception as exc:
+            logger.error(
+                event="exception",
+                stage="shadow_replay",
+                cycle_id=cycle_id,
+                exc_type=type(exc).__name__,
+                message=str(exc),
             )
-            report = report1
-            report2, snapshot2 = _run_shadow_replay_once(
-                args,
-                debug_enabled=debug_enabled,
-                deterministic_enabled=True,
-                read_only_state=True,
-            )
-            try:
-                detx.compare_deterministic_snapshots(snapshot1, snapshot2)
-            except Exception as exc:
-                reasons.append(f"deterministic_check_failed: {exc}")
+            reasons.append(str(exc))
+
+        if report is None:
+            report = {
+                "input_csv": cli_args.csv,
+                "status": "FAIL",
+                "reasons": reasons or ["unknown_error"],
+            }
+
+        if report.get("counts", {}).get("decisions_total", 0) == 0:
+            reasons.append("decisions_total==0")
+
+        if reasons:
+            report["status"] = "FAIL"
+            report["reasons"] = reasons
         else:
-            report, _ = _run_shadow_replay_once(
-                args,
-                debug_enabled=debug_enabled,
-                deterministic_enabled=False,
-                read_only_state=True,
+            report["status"] = "PASS"
+            report["reasons"] = []
+
+        _write_report(cli_args.out_json, report)
+
+        if report.get("status") == "PASS":
+            perf_payload = perf_history.build_perf_history_from_report(
+                report=report,
+                meta_state_path=cli_args.meta_state_path,
+                source_csv=report.get("input_csv") or cli_args.csv,
             )
+            if perf_payload is not None:
+                perf_path = perf_history.perf_history_path(cli_args.meta_state_path)
+                perf_history.write_perf_history(perf_path, perf_payload)
+                print(f"[perf_history] wrote path={perf_path}")
+            else:
+                print("[perf_history] skip write reason=missing_fields")
+        else:
+            print(f"[perf_history] skip write status={report.get('status')}")
+
+        if strict and report["status"] != "PASS":
+            rc = 1
+            raise RuntimeError("; ".join(report.get("reasons", []) or ["shadow_replay_failed"]))
     except Exception as exc:
-        reasons.append(str(exc))
-
-    if report is None:
-        report = {
-            "input_csv": cli_args.csv,
-            "status": "FAIL",
-            "reasons": reasons or ["unknown_error"],
-        }
-
-    if report.get("counts", {}).get("decisions_total", 0) == 0:
-        reasons.append("decisions_total==0")
-
-    if reasons:
-        report["status"] = "FAIL"
-        report["reasons"] = reasons
-    else:
-        report["status"] = "PASS"
-        report["reasons"] = []
-
-    _write_report(cli_args.out_json, report)
-
-    if report.get("status") == "PASS":
-        perf_payload = perf_history.build_perf_history_from_report(
-            report=report,
-            meta_state_path=cli_args.meta_state_path,
-            source_csv=report.get("input_csv") or cli_args.csv,
+        logger.error(
+            event="exception",
+            stage="shadow_replay",
+            cycle_id=cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
         )
-        if perf_payload is not None:
-            perf_path = perf_history.perf_history_path(cli_args.meta_state_path)
-            perf_history.write_perf_history(perf_path, perf_payload)
-            print(f"[perf_history] wrote path={perf_path}")
-        else:
-            print("[perf_history] skip write reason=missing_fields")
-    else:
-        print(f"[perf_history] skip write status={report.get('status')}")
-
-    if strict and report["status"] != "PASS":
-        raise RuntimeError("; ".join(report.get("reasons", []) or ["shadow_replay_failed"]))
+        if rc == 0:
+            rc = 1
+        raise
+    finally:
+        logger.info(
+            event="stage_end",
+            stage="shadow_replay",
+            cycle_id=cycle_id,
+            rc=int(rc),
+            duration_s=round(time.perf_counter() - t0, 6),
+        )
 
 
 if __name__ == "__main__":

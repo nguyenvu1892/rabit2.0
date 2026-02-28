@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from rabit.state import atomic_io
 from rabit.state.exit_codes import ExitCode
 from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
+from rabit.utils import StructuredLogger, generate_cycle_id, get_logger
 
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
@@ -37,6 +38,7 @@ _CYCLE_STATUS_RE = re.compile(r"^\[cycle\]\s+cycle_status=([^\s]+)", re.MULTILIN
 _CYCLE_DECISION_RE = re.compile(r"^\[cycle\]\s+decision=([^\s]+)", re.MULTILINE)
 _LEDGER_PATH_RE = re.compile(r"^\[cycle\]\s+ledger_path=([^\s]+)", re.MULTILINE)
 _CYCLE_RUNTIME_RE = re.compile(r"^\[cycle\]\s+total_runtime_seconds=([0-9]+(?:\.[0-9]+)?)", re.MULTILINE)
+_CYCLE_ID_RE = re.compile(r"^\[cycle\]\s+cycle_id=([^\s]+)", re.MULTILINE)
 _CANDIDATE_HASH_RE = re.compile(r"\bcandidate_hash=([0-9a-f]{64}|missing)\b")
 _APPROVED_HASH_RE = re.compile(r"\bapproved_hash=([0-9a-f]{64}|missing)\b")
 _BASE_HASH_RE = re.compile(r"\bbase_hash=([0-9a-f]{64}|missing)\b")
@@ -51,6 +53,7 @@ class CycleExecResult:
     candidate_hash: str
     approved_hash: str
     cycle_runtime_seconds: float
+    cycle_id: str
 
 
 def _utc_iso() -> str:
@@ -230,7 +233,15 @@ def _load_last_ledger_entry(ledger_path: str) -> Dict[str, Any]:
     return {}
 
 
-def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecResult:
+def _run_cycle(
+    csv: str,
+    reason: str,
+    strict: int,
+    dry_run: int,
+    *,
+    cycle_id: str,
+    logger: StructuredLogger,
+) -> CycleExecResult:
     cmd = [
         sys.executable,
         "-m",
@@ -245,10 +256,30 @@ def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecRes
         str(int(dry_run)),
         "--skip_global_lock",
         "1",
+        "--cycle_id",
+        cycle_id,
     ]
     _log(f"cycle_start cmd={_shell_join(cmd)}")
+    logger.info(
+        event="stage_start",
+        stage="meta_cycle",
+        cycle_id=cycle_id,
+        cmd=_shell_join(cmd),
+    )
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as exc:
+        dt_s = time.perf_counter() - t0
+        logger.error(
+            event="exception",
+            stage="meta_cycle",
+            cycle_id=cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
+            duration_s=round(dt_s, 6),
+        )
+        raise
     dt_s = time.perf_counter() - t0
 
     stdout = proc.stdout or ""
@@ -270,6 +301,7 @@ def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecRes
     decision = _last_match(combined, _CYCLE_DECISION_RE)
     ledger_path = _last_match(combined, _LEDGER_PATH_RE)
     runtime_text = _last_match(combined, _CYCLE_RUNTIME_RE)
+    returned_cycle_id = _last_match(combined, _CYCLE_ID_RE)
     cycle_runtime_seconds = dt_s
     if runtime_text:
         try:
@@ -316,6 +348,15 @@ def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecRes
     _log(f"decision={decision or 'UNKNOWN'}")
     _log(f"status={cycle_status}")
     _log(f"runtime_seconds={cycle_runtime_seconds:.3f}")
+    logger.info(
+        event="stage_end",
+        stage="meta_cycle",
+        cycle_id=returned_cycle_id or cycle_id,
+        rc=int(proc.returncode),
+        duration_s=round(cycle_runtime_seconds, 6),
+        decision=decision or "UNKNOWN",
+        cycle_status=cycle_status,
+    )
 
     return CycleExecResult(
         return_code=int(proc.returncode),
@@ -325,6 +366,7 @@ def _run_cycle(csv: str, reason: str, strict: int, dry_run: int) -> CycleExecRes
         candidate_hash=candidate_hash or "missing",
         approved_hash=approved_hash or "missing",
         cycle_runtime_seconds=float(cycle_runtime_seconds),
+        cycle_id=returned_cycle_id or cycle_id,
     )
 
 
@@ -346,6 +388,7 @@ def _build_audit_record(
     entry: Dict[str, Any] = {
         "timestamp": _utc_iso(),
         "mode": mode,
+        "cycle_id": cycle_result.cycle_id if cycle_result else "",
         "csv": args.csv,
         "reason": str(args.reason),
         "strict": int(args.strict),
@@ -381,7 +424,7 @@ def _sleep_interval(interval_seconds: float, started_at: float, max_runtime_seco
     return True
 
 
-def _run_once(args: argparse.Namespace, lock_ttl_sec: float) -> int:
+def _run_once(args: argparse.Namespace, lock_ttl_sec: float, *, logger: StructuredLogger) -> int:
     sched_t0 = time.perf_counter()
     policy = str(args.on_lock_held).strip().lower()
     lock_result = acquire_exclusive_lock(
@@ -394,6 +437,14 @@ def _run_once(args: argparse.Namespace, lock_ttl_sec: float) -> int:
         lock_exit_code = _lock_policy_exit_code(policy)
         _lock_log(
             f"held_by={lock_owner_summary(lock_result.owner)} age_s={lock_result.age_s:.3f} action={policy}"
+        )
+        logger.warn(
+            event="lock_held",
+            stage="lock",
+            cycle_id="",
+            action=policy,
+            owner=lock_owner_summary(lock_result.owner),
+            age_s=round(lock_result.age_s, 6),
         )
         record = _build_audit_record(
             args=args,
@@ -411,19 +462,32 @@ def _run_once(args: argparse.Namespace, lock_ttl_sec: float) -> int:
     lock_handle = lock_result.handle
     if lock_handle is None:
         _lock_log("status=error reason=missing_lock_handle")
+        logger.error(event="exception", stage="lock", cycle_id="", message="missing_lock_handle")
         return int(EXIT_ERROR)
 
     _lock_log(
         f"acquired path={args.lock_path} status={lock_result.status} stale_break={1 if lock_handle.stale_break else 0} "
         f"owner={lock_owner_summary(lock_result.owner)}"
     )
+    logger.info(
+        event="lock_acquired",
+        stage="lock",
+        cycle_id="",
+        path=args.lock_path,
+        status=lock_result.status,
+        stale_break=1 if lock_handle.stale_break else 0,
+        owner=lock_owner_summary(lock_result.owner),
+    )
     cycle_result: Optional[CycleExecResult] = None
     try:
+        cycle_id = generate_cycle_id(seed=f"{args.reason}:run_once")
         cycle_result = _run_cycle(
             csv=args.csv,
             reason=args.reason,
             strict=int(args.strict),
             dry_run=int(args.dry_run),
+            cycle_id=cycle_id,
+            logger=logger,
         )
         scheduler_status = _scheduler_status_from_return_code(cycle_result.return_code)
         record = _build_audit_record(
@@ -443,9 +507,16 @@ def _run_once(args: argparse.Namespace, lock_ttl_sec: float) -> int:
     finally:
         released = release_exclusive_lock(lock_handle)
         _lock_log(f"released path={args.lock_path} ok={1 if released else 0}")
+        logger.info(
+            event="lock_released",
+            stage="lock",
+            cycle_id=cycle_result.cycle_id if cycle_result is not None else "",
+            path=args.lock_path,
+            ok=1 if released else 0,
+        )
 
 
-def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float) -> int:
+def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float, *, logger: StructuredLogger) -> int:
     if args.interval_minutes is None or float(args.interval_minutes) <= 0:
         raise ValueError("interval_minutes must be > 0 for loop mode")
 
@@ -479,6 +550,14 @@ def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float) -> int:
             _lock_log(
                 f"held_by={lock_owner_summary(lock_result.owner)} age_s={lock_result.age_s:.3f} action={policy}"
             )
+            logger.warn(
+                event="lock_held",
+                stage="lock",
+                cycle_id="",
+                action=policy,
+                owner=lock_owner_summary(lock_result.owner),
+                age_s=round(lock_result.age_s, 6),
+            )
             record = _build_audit_record(
                 args=args,
                 mode="interval",
@@ -500,19 +579,32 @@ def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float) -> int:
         lock_handle = lock_result.handle
         if lock_handle is None:
             _lock_log("status=error reason=missing_lock_handle")
+            logger.error(event="exception", stage="lock", cycle_id="", message="missing_lock_handle")
             return int(EXIT_ERROR)
 
         _lock_log(
             f"acquired path={args.lock_path} status={lock_result.status} stale_break={1 if lock_handle.stale_break else 0} "
             f"owner={lock_owner_summary(lock_result.owner)}"
         )
+        logger.info(
+            event="lock_acquired",
+            stage="lock",
+            cycle_id="",
+            path=args.lock_path,
+            status=lock_result.status,
+            stale_break=1 if lock_handle.stale_break else 0,
+            owner=lock_owner_summary(lock_result.owner),
+        )
         cycle_result: Optional[CycleExecResult] = None
         try:
+            cycle_id = generate_cycle_id(seed=f"{cycle_reason}:{cycle_idx}")
             cycle_result = _run_cycle(
                 csv=args.csv,
                 reason=cycle_reason,
                 strict=int(args.strict),
                 dry_run=int(args.dry_run),
+                cycle_id=cycle_id,
+                logger=logger,
             )
             scheduler_status = _scheduler_status_from_return_code(cycle_result.return_code)
             record = _build_audit_record(
@@ -528,6 +620,13 @@ def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float) -> int:
         finally:
             released = release_exclusive_lock(lock_handle)
             _lock_log(f"released path={args.lock_path} ok={1 if released else 0}")
+            logger.info(
+                event="lock_released",
+                stage="lock",
+                cycle_id=cycle_result.cycle_id if cycle_result is not None else "",
+                path=args.lock_path,
+                ok=1 if released else 0,
+            )
 
         if _is_business_reject_outcome(cycle_result):
             _log("business_reject_not_error")
@@ -542,6 +641,8 @@ def _run_interval_loop(args: argparse.Namespace, lock_ttl_sec: float) -> int:
 def main() -> int:
     args = _parse_args()
     mode = "run_once" if int(args.run_once) == 1 else "interval"
+    schedule_cycle_id = generate_cycle_id(seed=f"schedule:{args.reason}")
+    logger = get_logger("meta_schedule").bind(cycle_id=schedule_cycle_id)
 
     if int(args.run_once) != 1 and args.interval_minutes is None:
         raise SystemExit("Either set --run_once 1 or provide --interval_minutes N.")
@@ -554,14 +655,54 @@ def main() -> int:
         f"dry_run={int(args.dry_run)} lock_path={args.lock_path} lock_ttl_sec={lock_ttl_sec:.3f} "
         f"force_lock_break={int(args.force_lock_break)} on_lock_held={args.on_lock_held}"
     )
+    logger.info(
+        event="stage_start",
+        stage="meta_schedule",
+        cycle_id=schedule_cycle_id,
+        mode=mode,
+        csv=args.csv,
+        reason=str(args.reason),
+        strict=int(args.strict),
+        dry_run=int(args.dry_run),
+        lock_path=args.lock_path,
+    )
 
+    t0 = time.perf_counter()
+    rc = int(EXIT_ERROR)
     try:
         if mode == "run_once":
-            return _run_once(args, lock_ttl_sec=lock_ttl_sec)
-        return _run_interval_loop(args, lock_ttl_sec=lock_ttl_sec)
+            rc = _run_once(args, lock_ttl_sec=lock_ttl_sec, logger=logger)
+            return int(rc)
+        rc = _run_interval_loop(args, lock_ttl_sec=lock_ttl_sec, logger=logger)
+        return int(rc)
     except KeyboardInterrupt:
         _log("status=INTERRUPTED")
-        return 130
+        logger.warn(
+            event="exception",
+            stage="meta_schedule",
+            cycle_id=schedule_cycle_id,
+            exc_type="KeyboardInterrupt",
+            message="interrupted",
+        )
+        rc = 130
+        return int(rc)
+    except Exception as exc:
+        logger.error(
+            event="exception",
+            stage="meta_schedule",
+            cycle_id=schedule_cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
+        )
+        raise
+    finally:
+        logger.info(
+            event="stage_end",
+            stage="meta_schedule",
+            cycle_id=schedule_cycle_id,
+            rc=int(rc),
+            duration_s=round(time.perf_counter() - t0, 6),
+        )
 
 
 if __name__ == "__main__":

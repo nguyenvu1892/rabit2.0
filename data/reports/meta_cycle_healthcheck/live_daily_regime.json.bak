@@ -1,0 +1,550 @@
+{
+  "days": [
+    {
+      "day": "2025-10-29",
+      "signals": 705,
+      "allowed": 71,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-10-30",
+      "signals": 1376,
+      "allowed": 63,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-10-31",
+      "signals": 1258,
+      "allowed": 66,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-02",
+      "signals": 59,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-03",
+      "signals": 1378,
+      "allowed": 60,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-04",
+      "signals": 1378,
+      "allowed": 78,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-05",
+      "signals": 1378,
+      "allowed": 67,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-06",
+      "signals": 1378,
+      "allowed": 79,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-07",
+      "signals": 1318,
+      "allowed": 67,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-09",
+      "signals": 59,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-10",
+      "signals": 1378,
+      "allowed": 55,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-11",
+      "signals": 1375,
+      "allowed": 68,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-12",
+      "signals": 1378,
+      "allowed": 46,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-13",
+      "signals": 1378,
+      "allowed": 70,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-14",
+      "signals": 1318,
+      "allowed": 105,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-16",
+      "signals": 59,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-17",
+      "signals": 1378,
+      "allowed": 72,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-18",
+      "signals": 1378,
+      "allowed": 58,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-19",
+      "signals": 1378,
+      "allowed": 70,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-20",
+      "signals": 1378,
+      "allowed": 78,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-21",
+      "signals": 1318,
+      "allowed": 62,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-23",
+      "signals": 59,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-24",
+      "signals": 1378,
+      "allowed": 41,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-25",
+      "signals": 1378,
+      "allowed": 76,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-26",
+      "signals": 1378,
+      "allowed": 68,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-27",
+      "signals": 1229,
+      "allowed": 89,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-28",
+      "signals": 1141,
+      "allowed": 73,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-11-30",
+      "signals": 53,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-01",
+      "signals": 1378,
+      "allowed": 58,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-02",
+      "signals": 1378,
+      "allowed": 66,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-03",
+      "signals": 1378,
+      "allowed": 68,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-04",
+      "signals": 1378,
+      "allowed": 77,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-05",
+      "signals": 1318,
+      "allowed": 89,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-07",
+      "signals": 29,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-08",
+      "signals": 1378,
+      "allowed": 94,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-09",
+      "signals": 1378,
+      "allowed": 70,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-10",
+      "signals": 1378,
+      "allowed": 102,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-11",
+      "signals": 1375,
+      "allowed": 56,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-12",
+      "signals": 1318,
+      "allowed": 62,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-14",
+      "signals": 57,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-15",
+      "signals": 1378,
+      "allowed": 77,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-16",
+      "signals": 1378,
+      "allowed": 71,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-17",
+      "signals": 1371,
+      "allowed": 66,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-18",
+      "signals": 1376,
+      "allowed": 84,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-19",
+      "signals": 1318,
+      "allowed": 79,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-21",
+      "signals": 56,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-22",
+      "signals": 1378,
+      "allowed": 73,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-23",
+      "signals": 1377,
+      "allowed": 73,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-24",
+      "signals": 1110,
+      "allowed": 66,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-25",
+      "signals": 49,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-26",
+      "signals": 1318,
+      "allowed": 62,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-28",
+      "signals": 59,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-29",
+      "signals": 1376,
+      "allowed": 95,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-30",
+      "signals": 1377,
+      "allowed": 73,
+      "dd_stop": false
+    },
+    {
+      "day": "2025-12-31",
+      "signals": 1318,
+      "allowed": 63,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-01",
+      "signals": 55,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-02",
+      "signals": 1318,
+      "allowed": 80,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-04",
+      "signals": 53,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-05",
+      "signals": 1374,
+      "allowed": 58,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-06",
+      "signals": 1377,
+      "allowed": 51,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-07",
+      "signals": 1377,
+      "allowed": 71,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-08",
+      "signals": 1377,
+      "allowed": 72,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-09",
+      "signals": 1318,
+      "allowed": 65,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-11",
+      "signals": 57,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-12",
+      "signals": 1377,
+      "allowed": 67,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-13",
+      "signals": 1377,
+      "allowed": 70,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-14",
+      "signals": 1375,
+      "allowed": 66,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-15",
+      "signals": 1377,
+      "allowed": 64,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-16",
+      "signals": 1318,
+      "allowed": 65,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-18",
+      "signals": 51,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-19",
+      "signals": 1227,
+      "allowed": 80,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-20",
+      "signals": 1378,
+      "allowed": 57,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-21",
+      "signals": 1377,
+      "allowed": 83,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-22",
+      "signals": 1378,
+      "allowed": 56,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-23",
+      "signals": 1318,
+      "allowed": 54,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-25",
+      "signals": 57,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-26",
+      "signals": 1377,
+      "allowed": 72,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-27",
+      "signals": 1368,
+      "allowed": 67,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-28",
+      "signals": 1373,
+      "allowed": 71,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-29",
+      "signals": 1377,
+      "allowed": 121,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-01-30",
+      "signals": 1318,
+      "allowed": 150,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-01",
+      "signals": 50,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-02",
+      "signals": 1377,
+      "allowed": 141,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-03",
+      "signals": 1377,
+      "allowed": 111,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-04",
+      "signals": 1377,
+      "allowed": 129,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-05",
+      "signals": 1377,
+      "allowed": 128,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-06",
+      "signals": 1318,
+      "allowed": 88,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-08",
+      "signals": 58,
+      "allowed": 0,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-09",
+      "signals": 1376,
+      "allowed": 106,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-10",
+      "signals": 1377,
+      "allowed": 103,
+      "dd_stop": false
+    },
+    {
+      "day": "2026-02-11",
+      "signals": 984,
+      "allowed": 79,
+      "dd_stop": false
+    }
+  ]
+}

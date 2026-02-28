@@ -17,6 +17,7 @@ from typing import List, Optional
 from rabit.state import atomic_io
 from rabit.state.exit_codes import ExitCode
 from rabit.state.file_lock import acquire_exclusive_lock, lock_owner_summary, release_exclusive_lock
+from rabit.utils import StructuredLogger, generate_cycle_id, get_logger
 
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
@@ -119,6 +120,7 @@ def _parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--skip_replay", type=int, choices=[0, 1], default=0, help="Skip shadow replay step")
     ap.add_argument("--skip_promote", type=int, choices=[0, 1], default=0, help="Skip promotion gate step")
+    ap.add_argument("--cycle_id", default="", help="Optional correlation id propagated across cycle stages")
     return ap.parse_args()
 
 
@@ -154,15 +156,41 @@ def _shell_join(parts: List[str]) -> str:
         return " ".join(parts)
 
 
-def _run_module(stage: str, module_name: str, module_args: List[str]) -> StageResult:
+def _run_module(
+    stage: str,
+    module_name: str,
+    module_args: List[str],
+    *,
+    logger: StructuredLogger,
+    cycle_id: str,
+) -> StageResult:
     cmd = [sys.executable, "-m", module_name] + module_args
     _log(f"stage={stage} start cmd={_shell_join(cmd)}")
-    t0 = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
+    logger.info(
+        event="stage_start",
+        stage=stage,
+        cycle_id=cycle_id,
+        module_name=module_name,
+        cmd=_shell_join(cmd),
     )
+    t0 = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        dt_s = time.perf_counter() - t0
+        logger.error(
+            event="exception",
+            stage=stage,
+            cycle_id=cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
+            duration_s=round(dt_s, 6),
+        )
+        raise
     dt_s = time.perf_counter() - t0
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
@@ -173,6 +201,13 @@ def _run_module(stage: str, module_name: str, module_args: List[str]) -> StageRe
         for line in stderr.splitlines():
             print(f"[cycle][{stage}][stderr] {line}")
     _log(f"stage={stage} end rc={proc.returncode} duration_s={dt_s:.3f}")
+    logger.info(
+        event="stage_end",
+        stage=stage,
+        cycle_id=cycle_id,
+        rc=int(proc.returncode),
+        duration_s=round(dt_s, 6),
+    )
     return StageResult(
         name=stage,
         return_code=int(proc.returncode),
@@ -308,6 +343,7 @@ def _append_optional_risk_args(cli: List[str], args: argparse.Namespace) -> None
 
 def _print_final_summary(
     *,
+    cycle_id: str,
     cycle_status: str,
     candidate_hash: str,
     decision: str,
@@ -317,6 +353,7 @@ def _print_final_summary(
     total_runtime_seconds: float,
 ) -> None:
     _log("summary_begin")
+    print(f"[cycle] cycle_id={cycle_id}")
     print(f"[cycle] cycle_status={cycle_status}")
     print(f"[cycle] candidate_hash={candidate_hash}")
     print(f"[cycle] decision={decision}")
@@ -327,7 +364,14 @@ def _print_final_summary(
     _log("summary_end")
 
 
-def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> int:
+def _run_cycle(
+    args: argparse.Namespace,
+    paths: CyclePaths,
+    dry_run: bool,
+    *,
+    logger: StructuredLogger,
+    cycle_id: str,
+) -> int:
     strict = int(args.strict) == 1
     skip_replay = int(args.skip_replay) == 1
     skip_promote = int(args.skip_promote) == 1
@@ -339,12 +383,18 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
     healthcheck_status = "SKIPPED"
     cycle_status = "FAIL"
     ledger_path = paths.promote_ledger_path
+    final_rc = int(EXIT_ERROR)
+
+    def _finish(code: int) -> int:
+        nonlocal final_rc
+        final_rc = int(code)
+        return final_rc
 
     try:
         if not os.path.exists(paths.approved_state_path):
             _log(f"approved_state_missing path={paths.approved_state_path}")
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         # Step 1: candidate generation
         step1 = _run_module(
@@ -362,19 +412,22 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
                 "--strict",
                 str(int(args.strict)),
             ],
+            logger=logger,
+            cycle_id=cycle_id,
         )
         if step1.return_code == EXIT_ERROR:
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
         if step1.return_code != EXIT_OK:
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         candidate_hash = _load_candidate_hash(paths.candidate_manifest_path, paths.candidate_path)
 
         # Step 2: shadow replay
         if skip_replay:
             _log("stage=shadow_replay skipped=1")
+            logger.info(event="stage_skip", stage="shadow_replay", cycle_id=cycle_id, skipped=1)
         else:
             step2 = _run_module(
                 "shadow_replay",
@@ -390,19 +443,24 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
                     str(int(args.strict)),
                     "--deterministic_check",
                     "1",
+                    "--cycle_id",
+                    cycle_id,
                 ],
+                logger=logger,
+                cycle_id=cycle_id,
             )
             if step2.return_code == EXIT_ERROR:
                 cycle_status = "FAIL"
-                return EXIT_ERROR
+                return _finish(EXIT_ERROR)
             if step2.return_code != EXIT_OK:
                 cycle_status = "FAIL"
-                return EXIT_ERROR
+                return _finish(EXIT_ERROR)
 
         # Step 3: promotion gate
         if skip_promote:
             decision = "SKIPPED"
             _log("stage=meta_promote skipped=1")
+            logger.info(event="stage_skip", stage="meta_promote", cycle_id=cycle_id, skipped=1)
         else:
             promote_cli = [
                 "--candidate_path",
@@ -415,6 +473,8 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
                 args.csv,
                 "--no_exit_on_reject",
                 "1" if dry_run else str(int(args.no_exit_on_reject)),
+                "--cycle_id",
+                cycle_id,
             ]
             if dry_run:
                 promote_cli.extend(
@@ -429,13 +489,19 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
                         paths.promote_ledger_path,
                     ]
                 )
-            step3 = _run_module("meta_promote", "scripts.meta_promote", promote_cli)
+            step3 = _run_module(
+                "meta_promote",
+                "scripts.meta_promote",
+                promote_cli,
+                logger=logger,
+                cycle_id=cycle_id,
+            )
             if step3.return_code >= ExitCode.DATA_INVALID:
                 cycle_status = "FAIL"
-                return int(step3.return_code)
+                return _finish(int(step3.return_code))
             if step3.return_code == EXIT_ERROR:
                 cycle_status = "FAIL"
-                return EXIT_ERROR
+                return _finish(EXIT_ERROR)
 
             promote_status, promote_hash, promote_ledger_path = _parse_promotion_stage(step3)
             if _is_sha256(promote_hash):
@@ -458,12 +524,12 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
 
             if decision == "ERROR":
                 cycle_status = "FAIL"
-                return EXIT_ERROR
+                return _finish(EXIT_ERROR)
 
             if strict and not dry_run and decision == "REJECTED":
                 _log("strict_reject=1 -> stop_before_post_validation")
                 cycle_status = "SUCCESS_WITH_REJECT"
-                return EXIT_REJECT
+                return _finish(EXIT_REJECT)
 
             if decision == "REJECTED" and not strict:
                 _log("non_strict_reject_allowed=1 -> continue")
@@ -484,21 +550,27 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
             "1",
         ]
         _append_optional_risk_args(det_cli, args)
-        det_stage = _run_module("deterministic_check", "scripts.live_sim_daily", det_cli)
+        det_stage = _run_module(
+            "deterministic_check",
+            "scripts.live_sim_daily",
+            det_cli,
+            logger=logger,
+            cycle_id=cycle_id,
+        )
         if det_stage.return_code == EXIT_ERROR:
             deterministic_status = "FAIL"
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
         if det_stage.return_code != EXIT_OK:
             deterministic_status = "FAIL"
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         det_status = _last_status(det_stage.combined_output, _DETERMINISTIC_STATUS_RE)
         deterministic_status = det_status if det_status else "PASS"
         if deterministic_status != "PASS":
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         materialize_cli = [
             "--csv",
@@ -511,15 +583,21 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
             paths.health_out_dir,
         ]
         _append_optional_risk_args(materialize_cli, args)
-        materialize_stage = _run_module("health_materialize", "scripts.live_sim_daily", materialize_cli)
+        materialize_stage = _run_module(
+            "health_materialize",
+            "scripts.live_sim_daily",
+            materialize_cli,
+            logger=logger,
+            cycle_id=cycle_id,
+        )
         if materialize_stage.return_code == EXIT_ERROR:
             healthcheck_status = "FAIL"
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
         if materialize_stage.return_code != EXIT_OK:
             healthcheck_status = "FAIL"
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         health_stage = _run_module(
             "healthcheck",
@@ -535,22 +613,26 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
                 os.path.join(paths.health_out_dir, "live_daily_regime.json"),
                 "--strict",
                 "1",
+                "--cycle_id",
+                cycle_id,
             ],
+            logger=logger,
+            cycle_id=cycle_id,
         )
         if health_stage.return_code == EXIT_ERROR:
             healthcheck_status = "FAIL"
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
         if health_stage.return_code != EXIT_OK:
             healthcheck_status = "FAIL"
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         health_status = _last_status(health_stage.combined_output, _HEALTHCHECK_STATUS_RE)
         healthcheck_status = health_status if health_status else "PASS"
         if healthcheck_status != "PASS":
             cycle_status = "FAIL"
-            return EXIT_ERROR
+            return _finish(EXIT_ERROR)
 
         if dry_run:
             cycle_status = "DRY_RUN_SUCCESS"
@@ -560,15 +642,23 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
             cycle_status = "SUCCESS_PROMOTION_SKIPPED"
         else:
             cycle_status = "SUCCESS"
-        return EXIT_OK
+        return _finish(EXIT_OK)
 
     except Exception as exc:
         _log(f"unexpected_error={exc}")
+        logger.error(
+            event="exception",
+            stage="meta_cycle",
+            cycle_id=cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
+        )
         cycle_status = "FAIL"
-        return EXIT_ERROR
+        return _finish(EXIT_ERROR)
     finally:
         elapsed = time.perf_counter() - t_total
         _print_final_summary(
+            cycle_id=cycle_id,
             cycle_status=cycle_status,
             candidate_hash=candidate_hash,
             decision=decision,
@@ -577,10 +667,30 @@ def _run_cycle(args: argparse.Namespace, paths: CyclePaths, dry_run: bool) -> in
             healthcheck_status=healthcheck_status,
             total_runtime_seconds=elapsed,
         )
+        logger.info(
+            event="stage_end",
+            stage="meta_cycle",
+            cycle_id=cycle_id,
+            rc=int(final_rc),
+            duration_s=round(elapsed, 6),
+            cycle_status=cycle_status,
+        )
 
 
 def main() -> int:
     args = _parse_args()
+    main_started = time.perf_counter()
+    cycle_id = str(getattr(args, "cycle_id", "") or "").strip() or generate_cycle_id(seed=str(args.reason))
+    logger = get_logger("meta_cycle").bind(cycle_id=cycle_id)
+    _log(f"cycle_id={cycle_id}")
+    logger.info(
+        event="stage_start",
+        stage="meta_cycle",
+        cycle_id=cycle_id,
+        reason=str(args.reason),
+        strict=int(args.strict),
+        dry_run=int(args.dry_run),
+    )
     dry_run = int(args.dry_run) == 1
     skip_global_lock = int(args.skip_global_lock) == 1
     lock_policy = _effective_lock_policy(args)
@@ -590,12 +700,13 @@ def main() -> int:
             with tempfile.TemporaryDirectory(prefix="meta_cycle_") as temp_root:
                 paths = _build_paths(dry_run=True, temp_root=temp_root)
                 _prepare_dry_run_state(paths)
-                return _run_cycle(args, paths, dry_run=True)
+                return _run_cycle(args, paths, dry_run=True, logger=logger, cycle_id=cycle_id)
         paths = _build_paths(dry_run=False, temp_root=None)
-        return _run_cycle(args, paths, dry_run=False)
+        return _run_cycle(args, paths, dry_run=False, logger=logger, cycle_id=cycle_id)
 
     if skip_global_lock:
         _lock_log("status=skip reason=skip_global_lock=1")
+        logger.info(event="lock_skip", stage="lock", cycle_id=cycle_id, reason="skip_global_lock=1")
         return _run_with_paths()
 
     lock_result = acquire_exclusive_lock(
@@ -608,22 +719,64 @@ def main() -> int:
         _lock_log(
             f"held_by={lock_owner_summary(lock_result.owner)} age_s={lock_result.age_s:.3f} action={lock_policy}"
         )
-        return _lock_policy_exit_code(lock_policy)
+        logger.warn(
+            event="lock_held",
+            stage="lock",
+            cycle_id=cycle_id,
+            action=lock_policy,
+            owner=lock_owner_summary(lock_result.owner),
+            age_s=round(lock_result.age_s, 6),
+        )
+        rc = _lock_policy_exit_code(lock_policy)
+        logger.info(
+            event="stage_end",
+            stage="meta_cycle",
+            cycle_id=cycle_id,
+            rc=int(rc),
+            duration_s=round(time.perf_counter() - main_started, 6),
+            cycle_status="LOCK_HELD",
+        )
+        return int(rc)
 
     lock_handle = lock_result.handle
     if lock_handle is None:
         _lock_log("status=error reason=missing_lock_handle")
+        logger.error(event="exception", stage="lock", cycle_id=cycle_id, message="missing_lock_handle")
+        logger.info(
+            event="stage_end",
+            stage="meta_cycle",
+            cycle_id=cycle_id,
+            rc=int(EXIT_ERROR),
+            duration_s=round(time.perf_counter() - main_started, 6),
+            cycle_status="FAIL",
+        )
         return int(EXIT_ERROR)
 
     _lock_log(
         f"acquired path={args.lock_path} status={lock_result.status} "
         f"stale_break={1 if lock_handle.stale_break else 0} owner={lock_owner_summary(lock_result.owner)}"
     )
+    logger.info(
+        event="lock_acquired",
+        stage="lock",
+        cycle_id=cycle_id,
+        path=args.lock_path,
+        status=lock_result.status,
+        stale_break=1 if lock_handle.stale_break else 0,
+        owner=lock_owner_summary(lock_result.owner),
+    )
     try:
         return _run_with_paths()
     finally:
         released = release_exclusive_lock(lock_handle)
         _lock_log(f"released path={args.lock_path} ok={1 if released else 0}")
+        logger.info(
+            event="lock_released",
+            stage="lock",
+            cycle_id=cycle_id,
+            path=args.lock_path,
+            ok=1 if released else 0,
+        )
 
 
 if __name__ == "__main__":

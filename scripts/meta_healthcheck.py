@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 from rabit.state import atomic_io
+from rabit.utils import get_logger
 
 
 def _load_json(path: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -84,11 +86,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--meta_state", required=False, help="Path to meta state JSON.")
     parser.add_argument("--regime", required=False, help="Path to regime JSON.")
     parser.add_argument("--strict", type=int, default=0, help="Strict mode (0/1).")
+    parser.add_argument("--cycle_id", default="", help="Optional correlation id propagated by meta_cycle")
     return parser.parse_args()
 
 
-def main() -> int:
-    args = _parse_args()
+def run(args: argparse.Namespace) -> int:
     strict = int(args.strict) == 1
 
     summary_ok, summary = _validate_summary(args.summary)
@@ -118,6 +120,42 @@ def main() -> int:
 
     print("[healthcheck] STATUS=FAIL")
     return 1
+
+
+def main() -> int:
+    args = _parse_args()
+    cycle_id = str(getattr(args, "cycle_id", "") or "").strip()
+    logger = get_logger("meta_healthcheck").bind(cycle_id=cycle_id)
+    logger.info(
+        event="stage_start",
+        stage="healthcheck",
+        cycle_id=cycle_id,
+        summary=args.summary,
+        equity=args.equity,
+        strict=int(args.strict),
+    )
+    t0 = time.perf_counter()
+    rc = 1
+    try:
+        rc = int(run(args))
+        return int(rc)
+    except Exception as exc:
+        logger.error(
+            event="exception",
+            stage="healthcheck",
+            cycle_id=cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
+        )
+        raise
+    finally:
+        logger.info(
+            event="stage_end",
+            stage="healthcheck",
+            cycle_id=cycle_id,
+            rc=int(rc),
+            duration_s=round(time.perf_counter() - t0, 6),
+        )
 
 
 if __name__ == "__main__":

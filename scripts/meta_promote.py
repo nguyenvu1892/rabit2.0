@@ -7,12 +7,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, Optional
 
 from rabit.meta import perf_history
 from rabit.state import atomic_io
 from rabit.state import promotion_gate
 from rabit.state.exit_codes import ExitCode
+from rabit.utils import get_logger
 from scripts import deterministic_utils as det
 
 DEFAULT_APPROVED_DIR = os.path.join("data", "meta_states", "current_approved")
@@ -105,6 +107,7 @@ def _parse_args() -> argparse.Namespace:
         help="If 1, return code 0 on reject (dev/test mode). Errors still return 2.",
     )
     ap.add_argument("--debug", type=int, default=0, help="Debug mode (0/1)")
+    ap.add_argument("--cycle_id", default="", help="Optional correlation id propagated by meta_cycle")
     return ap.parse_args()
 
 
@@ -407,6 +410,8 @@ def run(args: argparse.Namespace) -> int:
 
     candidate_path = args.candidate_path
     approved_path = _resolve_approved_path(args.approved_dir)
+    if str(getattr(args, "cycle_id", "") or "").strip():
+        print(f"[promote] cycle_id={str(args.cycle_id).strip()}")
     print(
         f"[promote] candidate_path={candidate_path} "
         f"perf_history={perf_history.perf_history_path(candidate_path)}"
@@ -612,11 +617,40 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = _parse_args()
+    cycle_id = str(getattr(args, "cycle_id", "") or "").strip()
+    logger = get_logger("meta_promote").bind(cycle_id=cycle_id)
+    logger.info(
+        event="stage_start",
+        stage="meta_promote",
+        cycle_id=cycle_id,
+        candidate_path=args.candidate_path,
+        strict=int(args.strict),
+        reason=str(args.reason),
+    )
+    t0 = time.perf_counter()
+    rc = int(ExitCode.INTERNAL_ERROR)
     try:
-        return run(args)
+        rc = int(run(args))
+        return int(rc)
     except Exception as exc:
+        logger.error(
+            event="exception",
+            stage="meta_promote",
+            cycle_id=cycle_id,
+            exc_type=type(exc).__name__,
+            message=str(exc),
+        )
         _print_summary_line("FAIL", str(exc), result=None, perf_summary=None)
-        return ExitCode.INTERNAL_ERROR
+        rc = int(ExitCode.INTERNAL_ERROR)
+        return int(rc)
+    finally:
+        logger.info(
+            event="stage_end",
+            stage="meta_promote",
+            cycle_id=cycle_id,
+            rc=int(rc),
+            duration_s=round(time.perf_counter() - t0, 6),
+        )
 
 
 if __name__ == "__main__":
