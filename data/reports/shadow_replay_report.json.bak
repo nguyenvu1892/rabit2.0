@@ -31,7 +31,7 @@
   },
   "input_csv": "data/live/XAUUSD_M1_live.csv",
   "meta_state_path": "data\\meta_states\\candidate\\meta_risk_state.json",
-  "meta_state_sha256": "d21968ab23ecad2b9cdebe08cd722aa6f5ac638905b6f34c3d28c64db146d0f8",
+  "meta_state_sha256": "d33e23db893f53923285b867fa2a8bfb88bb3152aa6608bb2291b2807257cebc",
   "model_mode": "regime_bank",
   "n_features": 14,
   "perf_daily": [
