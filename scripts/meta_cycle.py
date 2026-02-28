@@ -123,6 +123,16 @@ def _parse_args() -> argparse.Namespace:
         help="Pass-through to meta_promote (0/1)",
     )
     ap.add_argument(
+        "--enable_scoring",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Pass-through to meta_promote scoring layer (0/1)",
+    )
+    ap.add_argument("--w_pnl", type=float, default=1.0, help="Pass-through scoring weight for PnL.")
+    ap.add_argument("--w_win", type=float, default=1.0, help="Pass-through scoring weight for winrate.")
+    ap.add_argument("--w_dd", type=float, default=1.0, help="Pass-through scoring weight for drawdown.")
+    ap.add_argument(
         "--enable_anomaly_guard",
         type=int,
         choices=[0, 1],
@@ -586,6 +596,14 @@ def _run_cycle(
                 args.csv,
                 "--no_exit_on_reject",
                 "1" if dry_run else str(int(args.no_exit_on_reject)),
+                "--enable_scoring",
+                str(int(args.enable_scoring)),
+                "--w_pnl",
+                str(float(args.w_pnl)),
+                "--w_win",
+                str(float(args.w_win)),
+                "--w_dd",
+                str(float(args.w_dd)),
                 "--cycle_id",
                 cycle_id,
             ]
@@ -868,6 +886,10 @@ def main() -> int:
         reason=str(args.reason),
         strict=int(args.strict),
         dry_run=int(args.dry_run),
+        enable_scoring=int(args.enable_scoring),
+        w_pnl=float(args.w_pnl),
+        w_win=float(args.w_win),
+        w_dd=float(args.w_dd),
         enable_anomaly_guard=int(args.enable_anomaly_guard),
         auto_rollback=int(args.auto_rollback),
         simulate_anomaly=int(args.simulate_anomaly),

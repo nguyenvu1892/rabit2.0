@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import math
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import time
 from typing import Any, Dict, Optional
 
 from rabit.meta import perf_history
+from rabit.meta import scoring
 from rabit.state import atomic_io
 from rabit.state import promotion_gate
 from rabit.state.exit_codes import ExitCode
@@ -23,6 +25,7 @@ DEFAULT_REJECTED_DIR = os.path.join("data", "meta_states", "rejected")
 DEFAULT_LEDGER_PATH = os.path.join("data", "meta_states", "ledger.jsonl")
 DEFAULT_CSV = os.path.join("data", "live", "XAUUSD_M1_live.csv")
 DEFAULT_MODEL = os.path.join("data", "ars_best_theta_regime_bank.npz")
+DEFAULT_HOLDOUT_REPORT_PATH = os.path.join("data", "reports", "holdout", "holdout_report.json")
 
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
@@ -108,6 +111,16 @@ def _parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--debug", type=int, default=0, help="Debug mode (0/1)")
     ap.add_argument("--cycle_id", default="", help="Optional correlation id propagated by meta_cycle")
+    ap.add_argument(
+        "--enable_scoring",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Enable composite scoring layer after gate pass (0/1, default: 0).",
+    )
+    ap.add_argument("--w_pnl", type=float, default=1.0, help="Composite score weight for normalized PnL.")
+    ap.add_argument("--w_win", type=float, default=1.0, help="Composite score weight for normalized winrate.")
+    ap.add_argument("--w_dd", type=float, default=1.0, help="Composite score weight for normalized drawdown.")
     return ap.parse_args()
 
 
@@ -170,6 +183,16 @@ def _processing_error_exit_code(reason: Any) -> int | None:
 def _utc_iso() -> str:
     now = dt.datetime.now(dt.timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _round_float(value: Any, default: Optional[float] = None, digits: int = 8) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(out):
+        return default
+    return round(out, int(digits))
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -321,6 +344,20 @@ def _load_valid_perf_history(candidate_path: str, candidate_hash: str) -> tuple[
     return perf_path, payload
 
 
+def _load_optional_holdout_report(path: str = DEFAULT_HOLDOUT_REPORT_PATH) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
+    try:
+        payload, _ = atomic_io.load_json_with_fallback(path)
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
 def _deterministic_hash_from_perf_history(payload: Dict[str, Any]) -> str:
     run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
     data = {
@@ -355,6 +392,67 @@ def _append_ledger_entry(ledger_path: str, entry: Dict[str, Any]) -> None:
     )
 
 
+def _base_scoring_fields(
+    *,
+    enabled: bool,
+    w_pnl: float,
+    w_win: float,
+    w_dd: float,
+) -> Dict[str, Any]:
+    return {
+        "scoring_enabled": int(bool(enabled)),
+        "score_total": None,
+        "score_in_sample": None,
+        "score_holdout": None,
+        "score_components": {
+            "dd_norm": None,
+            "pnl_norm": None,
+            "w_dd": _round_float(w_dd, default=1.0),
+            "w_pnl": _round_float(w_pnl, default=1.0),
+            "w_win": _round_float(w_win, default=1.0),
+            "winrate_norm": None,
+        },
+        "scoring_notes": {
+            "dd_missing": 0,
+            "normalization_method": "disabled",
+            "winrate_missing": 0,
+        },
+    }
+
+
+def _compute_scoring_fields(
+    *,
+    perf_payload: Dict[str, Any],
+    enable_scoring: bool,
+    w_pnl: float,
+    w_win: float,
+    w_dd: float,
+) -> Dict[str, Any]:
+    fields = _base_scoring_fields(enabled=enable_scoring, w_pnl=w_pnl, w_win=w_win, w_dd=w_dd)
+    if not enable_scoring:
+        return fields
+
+    in_sample_metrics = perf_history.perf_metrics_from_history(perf_payload)
+    score_payload = scoring.compute_scores(
+        in_sample_metrics,
+        holdout_report=_load_optional_holdout_report(DEFAULT_HOLDOUT_REPORT_PATH),
+        w_pnl=float(w_pnl),
+        w_win=float(w_win),
+        w_dd=float(w_dd),
+    )
+
+    fields.update(
+        {
+            "score_total": score_payload.get("score_total"),
+            "score_in_sample": score_payload.get("score_in_sample"),
+            "score_holdout": score_payload.get("score_holdout"),
+            "score_components": score_payload.get("score_components", fields.get("score_components", {})),
+            "scoring_notes": score_payload.get("scoring_notes", fields.get("scoring_notes", {})),
+        }
+    )
+    return fields
+
+
 def _build_ledger_entry(
     result: promotion_gate.PromotionGateResult,
     perf_payload: Dict[str, Any],
@@ -362,6 +460,7 @@ def _build_ledger_entry(
     base_hash: str,
     decision: str,
     reason: str = "",
+    scoring_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     replay_hash = result.replay_hash
     if not replay_hash or replay_hash == "missing":
@@ -379,6 +478,8 @@ def _build_ledger_entry(
         "reason": reason if decision == "rejected" else "",
         "perf_history_path": perf_path,
     }
+    if isinstance(scoring_fields, dict):
+        entry.update(scoring_fields)
     return entry
 
 
@@ -402,11 +503,20 @@ def _atomic_promote(
     return archived_path
 
 
-def run(args: argparse.Namespace) -> int:
+def run(
+    args: argparse.Namespace,
+    *,
+    logger: Optional[Any] = None,
+    cycle_id: str = "",
+) -> int:
     strict = int(args.strict) == 1
     replay_check = int(args.replay_check) == 1
     no_exit_on_reject = int(args.no_exit_on_reject) == 1
     debug = int(args.debug) == 1
+    enable_scoring = int(getattr(args, "enable_scoring", 0)) == 1
+    w_pnl = float(getattr(args, "w_pnl", 1.0))
+    w_win = float(getattr(args, "w_win", 1.0))
+    w_dd = float(getattr(args, "w_dd", 1.0))
 
     candidate_path = args.candidate_path
     approved_path = _resolve_approved_path(args.approved_dir)
@@ -438,6 +548,12 @@ def run(args: argparse.Namespace) -> int:
     stamp = _timestamp()
     perf_summary = _perf_summary_fields(result)
     base_hash = result.approved_hash if result is not None else "missing"
+    scoring_fields = _base_scoring_fields(
+        enabled=enable_scoring,
+        w_pnl=w_pnl,
+        w_win=w_win,
+        w_dd=w_dd,
+    )
 
     if not result.ok:
         processing_error_exit_code = _processing_error_exit_code(result.reason)
@@ -460,6 +576,7 @@ def run(args: argparse.Namespace) -> int:
                 base_hash=base_hash,
                 decision="rejected",
                 reason=result.reason,
+                scoring_fields=scoring_fields,
             )
         except Exception as exc:
             _print_summary_line(
@@ -513,6 +630,7 @@ def run(args: argparse.Namespace) -> int:
             perf_reason=perf_summary.get("perf_reason"),
             rejected_path=rejected_path or "missing",
             ledger_path=args.ledger_path,
+            scoring_enabled=int(enable_scoring),
         )
         if no_exit_on_reject:
             return EXIT_OK
@@ -540,6 +658,24 @@ def run(args: argparse.Namespace) -> int:
         )
         return ExitCode.DATA_INVALID
 
+    scoring_fields = _compute_scoring_fields(
+        perf_payload=perf_payload,
+        enable_scoring=enable_scoring,
+        w_pnl=w_pnl,
+        w_win=w_win,
+        w_dd=w_dd,
+    )
+    if enable_scoring and logger is not None:
+        event_fields: Dict[str, Any] = {
+            "stage": "meta_promote",
+            "cycle_id": cycle_id,
+            "candidate_hash": result.candidate_hash,
+            "score_total": scoring_fields.get("score_total"),
+        }
+        if scoring_fields.get("score_holdout") is not None:
+            event_fields["score_holdout"] = scoring_fields.get("score_holdout")
+        logger.info(event="scoring_computed", **event_fields)
+
     try:
         archived_path = _atomic_promote(
             candidate_path=candidate_path,
@@ -565,6 +701,7 @@ def run(args: argparse.Namespace) -> int:
             perf_path=perf_path,
             base_hash=base_hash,
             decision="approved",
+            scoring_fields=scoring_fields,
         )
         _append_ledger_entry(args.ledger_path, ledger_entry)
     except Exception as exc:
@@ -611,6 +748,9 @@ def run(args: argparse.Namespace) -> int:
         archived_path=archived_path,
         manifest_path=manifest_path,
         ledger_path=args.ledger_path,
+        score_total=_safe_summary_value(scoring_fields.get("score_total")),
+        score_holdout=_safe_summary_value(scoring_fields.get("score_holdout")),
+        scoring_enabled=int(enable_scoring),
     )
     return EXIT_OK
 
@@ -630,7 +770,7 @@ def main() -> int:
     t0 = time.perf_counter()
     rc = int(ExitCode.INTERNAL_ERROR)
     try:
-        rc = int(run(args))
+        rc = int(run(args, logger=logger, cycle_id=cycle_id))
         return int(rc)
     except Exception as exc:
         logger.error(
