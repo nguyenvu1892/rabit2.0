@@ -30,6 +30,11 @@ DEFAULT_HOLDOUT_REPORT_PATH = os.path.join("data", "reports", "holdout", "holdou
 EXIT_OK = ExitCode.SUCCESS
 EXIT_REJECT = ExitCode.BUSINESS_REJECT
 EXIT_ERROR = ExitCode.INTERNAL_ERROR
+EXIT_CODE_SCORING_FAIL = ExitCode.DATA_INVALID
+
+SCORING_ERROR_HOLDOUT_REPORT_MISSING = "SCORING_ERROR: HOLDOUT_REPORT_MISSING"
+SCORING_ERROR_HOLDOUT_REPORT_INVALID = "SCORING_ERROR: HOLDOUT_REPORT_INVALID"
+SCORING_ERROR_SCORE_COMPUTE_FAILED = "SCORING_ERROR: SCORE_COMPUTE_FAILED"
 
 _REJECT_REASON_PREFIXES = (
     "guardrail_",
@@ -366,17 +371,65 @@ def _load_valid_perf_history(candidate_path: str, candidate_hash: str) -> tuple[
     return perf_path, payload
 
 
-def _load_optional_holdout_report(path: str = DEFAULT_HOLDOUT_REPORT_PATH) -> Optional[Dict[str, Any]]:
-    if not path:
+def _load_holdout_report(
+    path: str = DEFAULT_HOLDOUT_REPORT_PATH,
+    *,
+    required: bool = False,
+) -> Optional[Dict[str, Any]]:
+    source = str(path or "").strip()
+    if not source:
+        if required:
+            raise RuntimeError(f"{SCORING_ERROR_HOLDOUT_REPORT_MISSING} path={path}")
         return None
-    if not os.path.exists(path):
+    if not os.path.exists(source):
+        if required:
+            raise RuntimeError(f"{SCORING_ERROR_HOLDOUT_REPORT_MISSING} path={source}")
         return None
     try:
-        payload, _ = atomic_io.load_json_with_fallback(path)
-    except Exception:
+        payload, _ = atomic_io.load_json_with_fallback(source)
+    except Exception as exc:
+        if required:
+            raise RuntimeError(f"{SCORING_ERROR_HOLDOUT_REPORT_INVALID} path={source} detail={exc}") from exc
         return None
     if isinstance(payload, dict):
+        if required and not isinstance(payload.get("metrics"), dict):
+            raise RuntimeError(f"{SCORING_ERROR_HOLDOUT_REPORT_INVALID} path={source} metrics=missing")
         return payload
+    if required:
+        raise RuntimeError(f"{SCORING_ERROR_HOLDOUT_REPORT_INVALID} path={source} type={type(payload).__name__}")
+    return None
+
+
+def _require_score_float(field_name: str, value: Any) -> float:
+    out = _round_float(value, default=None)
+    if out is None:
+        raise RuntimeError(f"{SCORING_ERROR_SCORE_COMPUTE_FAILED} field={field_name} value={value}")
+    return float(out)
+
+
+def _normalize_scoring_error(exc: Exception) -> str:
+    reason = str(exc)
+    if reason.startswith("SCORING_ERROR:"):
+        return reason
+    return f"{SCORING_ERROR_SCORE_COMPUTE_FAILED} detail={reason}"
+
+
+def _log_scoring_error(
+    logger: Optional[Any],
+    *,
+    cycle_id: str,
+    candidate_hash: str,
+    reason: str,
+) -> None:
+    if logger is None:
+        return
+    logger.error(
+        event="scoring_error",
+        stage="meta_promote",
+        cycle_id=cycle_id,
+        candidate_hash=candidate_hash,
+        reason=reason,
+    )
     return None
 
 
@@ -462,25 +515,38 @@ def _compute_scoring_fields(
     w_win: float,
     w_dd: float,
     holdout_report_path: str = DEFAULT_HOLDOUT_REPORT_PATH,
+    require_holdout_report: bool = False,
 ) -> Dict[str, Any]:
     fields = _base_scoring_fields(enabled=enable_scoring, w_pnl=w_pnl, w_win=w_win, w_dd=w_dd)
     if not enable_scoring:
         return fields
 
     in_sample_metrics = perf_history.perf_metrics_from_history(perf_payload)
+    holdout_report = _load_holdout_report(
+        holdout_report_path,
+        required=bool(require_holdout_report),
+    )
     score_payload = scoring.compute_scores(
         in_sample_metrics,
-        holdout_report=_load_optional_holdout_report(holdout_report_path),
+        holdout_report=holdout_report,
         w_pnl=float(w_pnl),
         w_win=float(w_win),
         w_dd=float(w_dd),
     )
 
+    score_total = _require_score_float("score_total", score_payload.get("score_total"))
+    score_in_sample = _require_score_float("score_in_sample", score_payload.get("score_in_sample"))
+    score_holdout_raw = score_payload.get("score_holdout")
+    if require_holdout_report:
+        score_holdout: Optional[float] = _require_score_float("score_holdout", score_holdout_raw)
+    else:
+        score_holdout = _round_float(score_holdout_raw, default=None)
+
     fields.update(
         {
-            "score_total": score_payload.get("score_total"),
-            "score_in_sample": score_payload.get("score_in_sample"),
-            "score_holdout": score_payload.get("score_holdout"),
+            "score_total": score_total,
+            "score_in_sample": score_in_sample,
+            "score_holdout": score_holdout,
             "score_components": score_payload.get("score_components", fields.get("score_components", {})),
             "scoring_notes": score_payload.get("scoring_notes", fields.get("scoring_notes", {})),
         }
@@ -624,7 +690,8 @@ def run(
             else:
                 gate_status = "REJECT"
                 eval_rc = int(EXIT_OK)
-        else:
+
+        if gate_status in ("PASS", "REJECT"):
             try:
                 perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
             except Exception as exc:
@@ -632,25 +699,37 @@ def run(
                 gate_reason = str(exc)
                 eval_rc = int(ExitCode.DATA_INVALID)
             else:
-                scoring_fields = _compute_scoring_fields(
-                    perf_payload=perf_payload,
-                    enable_scoring=enable_scoring,
-                    w_pnl=w_pnl,
-                    w_win=w_win,
-                    w_dd=w_dd,
-                    holdout_report_path=holdout_report_path,
-                )
-                if logger is not None:
-                    event_fields: Dict[str, Any] = {
-                        "stage": "meta_promote",
-                        "cycle_id": cycle_id,
-                        "candidate_hash": result.candidate_hash,
-                        "score_total": scoring_fields.get("score_total"),
-                        "gate_status": gate_status,
-                    }
-                    if scoring_fields.get("score_holdout") is not None:
-                        event_fields["score_holdout"] = scoring_fields.get("score_holdout")
-                    logger.info(event="scoring_computed", **event_fields)
+                try:
+                    scoring_fields = _compute_scoring_fields(
+                        perf_payload=perf_payload,
+                        enable_scoring=enable_scoring,
+                        w_pnl=w_pnl,
+                        w_win=w_win,
+                        w_dd=w_dd,
+                        holdout_report_path=holdout_report_path,
+                        require_holdout_report=enable_scoring,
+                    )
+                except Exception as exc:
+                    gate_status = "FAIL"
+                    gate_reason = _normalize_scoring_error(exc)
+                    eval_rc = int(EXIT_CODE_SCORING_FAIL)
+                    _log_scoring_error(
+                        logger,
+                        cycle_id=cycle_id,
+                        candidate_hash=result.candidate_hash,
+                        reason=gate_reason,
+                    )
+                else:
+                    if logger is not None:
+                        logger.info(
+                            event="scoring_computed",
+                            stage="meta_promote",
+                            cycle_id=cycle_id,
+                            candidate_hash=result.candidate_hash,
+                            score_total=scoring_fields.get("score_total"),
+                            score_holdout=scoring_fields.get("score_holdout"),
+                            gate_status=gate_status,
+                        )
 
         eval_payload: Dict[str, Any] = {
             "gate_status": gate_status,
@@ -705,6 +784,45 @@ def run(
 
         try:
             perf_path, perf_payload = _load_valid_perf_history(candidate_path, result.candidate_hash)
+        except Exception as exc:
+            _print_summary_line(
+                "FAIL",
+                f"ledger_entry_failed {exc}",
+                result,
+                perf_summary,
+                perf_reason=perf_summary.get("perf_reason"),
+            )
+            return ExitCode.STATE_CORRUPT
+        try:
+            scoring_fields = _compute_scoring_fields(
+                perf_payload=perf_payload,
+                enable_scoring=enable_scoring,
+                w_pnl=w_pnl,
+                w_win=w_win,
+                w_dd=w_dd,
+                holdout_report_path=holdout_report_path,
+                require_holdout_report=enable_scoring,
+            )
+        except Exception as exc:
+            scoring_reason = _normalize_scoring_error(exc)
+            _print_summary_line(
+                "FAIL",
+                scoring_reason,
+                result,
+                perf_summary,
+                perf_reason=perf_summary.get("perf_reason"),
+                score_total=_safe_summary_value(scoring_fields.get("score_total")),
+                score_holdout=_safe_summary_value(scoring_fields.get("score_holdout")),
+                scoring_enabled=int(enable_scoring),
+            )
+            _log_scoring_error(
+                logger,
+                cycle_id=cycle_id,
+                candidate_hash=result.candidate_hash,
+                reason=scoring_reason,
+            )
+            return int(EXIT_CODE_SCORING_FAIL)
+        try:
             ledger_entry = _build_ledger_entry(
                 result=result,
                 perf_payload=perf_payload,
@@ -767,6 +885,8 @@ def run(
             perf_reason=perf_summary.get("perf_reason"),
             rejected_path=rejected_path or "missing",
             ledger_path=args.ledger_path,
+            score_total=_safe_summary_value(scoring_fields.get("score_total")),
+            score_holdout=_safe_summary_value(scoring_fields.get("score_holdout")),
             scoring_enabled=int(enable_scoring),
         )
         if no_exit_on_reject:
@@ -795,24 +915,44 @@ def run(
         )
         return ExitCode.DATA_INVALID
 
-    scoring_fields = _compute_scoring_fields(
-        perf_payload=perf_payload,
-        enable_scoring=enable_scoring,
-        w_pnl=w_pnl,
-        w_win=w_win,
-        w_dd=w_dd,
-        holdout_report_path=holdout_report_path,
-    )
+    try:
+        scoring_fields = _compute_scoring_fields(
+            perf_payload=perf_payload,
+            enable_scoring=enable_scoring,
+            w_pnl=w_pnl,
+            w_win=w_win,
+            w_dd=w_dd,
+            holdout_report_path=holdout_report_path,
+            require_holdout_report=enable_scoring,
+        )
+    except Exception as exc:
+        scoring_reason = _normalize_scoring_error(exc)
+        _print_summary_line(
+            "FAIL",
+            scoring_reason,
+            result=result,
+            perf_summary=perf_summary,
+            perf_reason=perf_summary.get("perf_reason"),
+            score_total=_safe_summary_value(scoring_fields.get("score_total")),
+            score_holdout=_safe_summary_value(scoring_fields.get("score_holdout")),
+            scoring_enabled=int(enable_scoring),
+        )
+        _log_scoring_error(
+            logger,
+            cycle_id=cycle_id,
+            candidate_hash=result.candidate_hash,
+            reason=scoring_reason,
+        )
+        return int(EXIT_CODE_SCORING_FAIL)
     if enable_scoring and logger is not None:
-        event_fields: Dict[str, Any] = {
-            "stage": "meta_promote",
-            "cycle_id": cycle_id,
-            "candidate_hash": result.candidate_hash,
-            "score_total": scoring_fields.get("score_total"),
-        }
-        if scoring_fields.get("score_holdout") is not None:
-            event_fields["score_holdout"] = scoring_fields.get("score_holdout")
-        logger.info(event="scoring_computed", **event_fields)
+        logger.info(
+            event="scoring_computed",
+            stage="meta_promote",
+            cycle_id=cycle_id,
+            candidate_hash=result.candidate_hash,
+            score_total=scoring_fields.get("score_total"),
+            score_holdout=scoring_fields.get("score_holdout"),
+        )
 
     try:
         archived_path = _atomic_promote(

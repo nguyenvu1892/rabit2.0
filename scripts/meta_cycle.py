@@ -45,6 +45,7 @@ _CANDIDATE_HASH_RE = re.compile(r"\bcandidate_hash=([0-9a-f]{64}|missing)\b")
 _LEDGER_PATH_RE = re.compile(r"\bledger_path=([^\s]+)")
 _DETERMINISTIC_STATUS_RE = re.compile(r"\[deterministic\]\s+STATUS=(PASS|FAIL)")
 _HEALTHCHECK_STATUS_RE = re.compile(r"\[healthcheck\]\s+STATUS=(PASS|FAIL)")
+_SCORING_ERROR_RE = re.compile(r"(SCORING_ERROR:\s*[A-Z_]+[^\r\n]*)")
 
 _MUTATION_K_MIN = 3
 _MUTATION_K_MAX = 5
@@ -105,6 +106,8 @@ class MutationSelection:
     mutation_seed_basis: str
     mutation_profile: str
     selection_reason: str
+    selection_decision: str
+    promote_action: str
     ledger_extra_path: str
 
 
@@ -391,6 +394,15 @@ def _last_status(text: str, pattern: re.Pattern[str]) -> str:
     return status
 
 
+def _extract_scoring_error(text: str) -> str:
+    if not text:
+        return ""
+    matches = _SCORING_ERROR_RE.findall(str(text))
+    if not matches:
+        return ""
+    return str(matches[-1]).strip()
+
+
 def _parse_promotion_stage(result: StageResult) -> tuple[str, str, str]:
     combined = result.combined_output
     status = _last_status(combined, _PROMOTION_STATUS_RE)
@@ -637,7 +649,6 @@ def _run_mutation_selection(
         cycle_id=cycle_id,
         approved_hash=approved_hash,
         candidate_hash="pending",
-        score_total=None,
         gate_status="PENDING",
         k_candidates=int(k_candidates),
         mutation_seed=int(seed),
@@ -708,7 +719,6 @@ def _run_mutation_selection(
             cycle_id=cycle_id,
             approved_hash=approved_hash,
             candidate_hash=candidate_hash,
-            score_total=None,
             gate_status="PENDING",
             candidate_index=int(idx),
         )
@@ -765,7 +775,6 @@ def _run_mutation_selection(
                 cycle_id=cycle_id,
                 approved_hash=approved_hash,
                 candidate_hash=candidate.candidate_hash,
-                score_total=None,
                 gate_status=candidate.gate_status,
             )
             continue
@@ -782,7 +791,7 @@ def _run_mutation_selection(
             "--no_exit_on_reject",
             "1",
             "--enable_scoring",
-            "1",
+            str(int(args.enable_scoring)),
             "--w_pnl",
             str(float(args.w_pnl)),
             "--w_win",
@@ -814,6 +823,9 @@ def _run_mutation_selection(
             cycle_id=cycle_id,
         )
         if eval_stage.return_code >= ExitCode.DATA_INVALID or eval_stage.return_code == EXIT_ERROR:
+            scoring_error = _extract_scoring_error(eval_stage.combined_output)
+            if scoring_error:
+                raise RuntimeError(scoring_error)
             raise RuntimeError(f"mutation_eval_failed index={candidate.index} rc={eval_stage.return_code}")
 
         eval_payload = _load_json_dict(candidate.eval_report_path)
@@ -824,10 +836,22 @@ def _run_mutation_selection(
         candidate.gate_reason = str(eval_payload.get("gate_reason", "missing")).strip() or "missing"
         candidate.score_total = _safe_float_or_none(eval_payload.get("score_total"))
         candidate.score_holdout = _safe_float_or_none(eval_payload.get("score_holdout"))
+        if int(args.enable_scoring) == 1:
+            if candidate.score_total is None:
+                raise RuntimeError(
+                    "SCORING_ERROR: SCORE_TOTAL_MISSING "
+                    f"index={candidate.index} candidate_hash={candidate.candidate_hash}"
+                )
+            if candidate.score_holdout is None:
+                raise RuntimeError(
+                    "SCORING_ERROR: SCORE_HOLDOUT_MISSING "
+                    f"index={candidate.index} candidate_hash={candidate.candidate_hash}"
+                )
         _log(
             "mutation_candidate_evaluated "
             f"index={candidate.index} candidate_hash={candidate.candidate_hash} "
-            f"gate_status={candidate.gate_status} score_total={candidate.score_total}"
+            f"gate_status={candidate.gate_status} "
+            f"score_total={candidate.score_total} score_holdout={candidate.score_holdout}"
         )
         logger.info(
             event="mutation_candidate_evaluated",
@@ -836,6 +860,7 @@ def _run_mutation_selection(
             approved_hash=approved_hash,
             candidate_hash=candidate.candidate_hash,
             score_total=_round8_or_none(candidate.score_total),
+            score_holdout=_round8_or_none(candidate.score_holdout),
             gate_status=candidate.gate_status,
         )
 
@@ -857,14 +882,28 @@ def _run_mutation_selection(
             selected = candidate
             best_score = float(score)
 
+    selection_decision = "PROMOTE_CANDIDATE"
+    promote_action = "RUN_PROMOTE"
     if selected is None:
-        selection_reason = "no_pass_candidates"
-        selected_hash = None
-        selection_score = None
+        fallback_candidate = candidates[0] if candidates else None
+        selected = fallback_candidate
+        selected_hash = fallback_candidate.candidate_hash if fallback_candidate is not None else approved_hash
+        if not _is_sha256(selected_hash):
+            selected_hash = approved_hash if _is_sha256(approved_hash) else selected_hash
+        selection_score = _round8_or_none(fallback_candidate.score_total if fallback_candidate is not None else None)
+        selection_holdout = _round8_or_none(
+            fallback_candidate.score_holdout if fallback_candidate is not None else None
+        )
         selection_gate = "REJECT"
+        selection_reason = "NO_PASS_CANDIDATES"
+        selection_decision = "NOOP"
+        promote_action = "KEEP_APPROVED"
     else:
         selected_hash = selected.candidate_hash
+        if not _is_sha256(selected_hash):
+            selected_hash = approved_hash if _is_sha256(approved_hash) else selected_hash
         selection_score = _round8_or_none(best_score)
+        selection_holdout = _round8_or_none(selected.score_holdout)
         selection_gate = "PASS"
         if best_score is None:
             selection_reason = f"pass_without_score_fallback candidate_index={selected.index}"
@@ -879,14 +918,20 @@ def _run_mutation_selection(
         stage="meta_promote_eval",
         cycle_id=cycle_id,
         approved_hash=approved_hash,
-        candidate_hash=selected_hash or "missing",
+        candidate_hash=selected_hash,
         score_total=selection_score,
+        score_holdout=selection_holdout,
         gate_status=selection_gate,
+        selection_reason=selection_reason,
+        decision=selection_decision,
+        promote_action=promote_action,
     )
     _log(
         "mutation_selection "
-        f"selected_candidate_hash={selected_hash or 'missing'} "
-        f"selection_reason={selection_reason}"
+        f"selected_candidate_hash={selected_hash} "
+        f"score_total={selection_score} score_holdout={selection_holdout} "
+        f"selection_reason={selection_reason} decision={selection_decision} "
+        f"promote_action={promote_action}"
     )
 
     ledger_candidates: List[Dict[str, Any]] = []
@@ -930,6 +975,8 @@ def _run_mutation_selection(
         mutation_seed_basis=seed_basis,
         mutation_profile=profile,
         selection_reason=selection_reason,
+        selection_decision=selection_decision,
+        promote_action=promote_action,
         ledger_extra_path=ledger_extra_path,
     )
 
@@ -1115,97 +1162,136 @@ def _run_cycle(
                     f"intensity={round(float(intensity), 8)} knobs={effective_knobs}"
                 )
             approved_hash = _sha256_file(paths.approved_state_path)
-            mutation_selection = _run_mutation_selection(
-                args=args,
-                paths=paths,
-                dry_run=dry_run,
-                logger=logger,
-                cycle_id=cycle_id,
-                approved_hash=approved_hash,
-                mutation_cfg=mutation_knobs_cfg,
-            )
+            try:
+                mutation_selection = _run_mutation_selection(
+                    args=args,
+                    paths=paths,
+                    dry_run=dry_run,
+                    logger=logger,
+                    cycle_id=cycle_id,
+                    approved_hash=approved_hash,
+                    mutation_cfg=mutation_knobs_cfg,
+                )
+            except Exception as exc:
+                scoring_error = _extract_scoring_error(str(exc))
+                if not scoring_error and "SCORING_ERROR:" in str(exc):
+                    scoring_error = str(exc).strip()
+                if scoring_error:
+                    _log(scoring_error)
+                    logger.error(
+                        event="scoring_error",
+                        stage="meta_promote_eval",
+                        cycle_id=cycle_id,
+                        reason=scoring_error,
+                    )
+                    cycle_status = "FAIL"
+                    return _finish(int(ExitCode.DATA_INVALID))
+                raise
             if not mutation_selection.candidates:
                 cycle_status = "FAIL"
                 return _finish(EXIT_ERROR)
 
             final_candidate = mutation_selection.selected or mutation_selection.candidates[0]
             candidate_hash = final_candidate.candidate_hash
-            promote_cli = [
-                "--candidate_path",
-                final_candidate.candidate_path,
-                "--reason",
-                args.reason,
-                "--strict",
-                str(int(args.strict)),
-                "--csv",
-                args.csv,
-                "--no_exit_on_reject",
-                "1",
-                "--enable_scoring",
-                str(int(args.enable_scoring)),
-                "--w_pnl",
-                str(float(args.w_pnl)),
-                "--w_win",
-                str(float(args.w_win)),
-                "--w_dd",
-                str(float(args.w_dd)),
-                "--cycle_id",
-                cycle_id,
-                "--ledger_extra_path",
-                mutation_selection.ledger_extra_path,
-            ]
-            if dry_run:
-                promote_cli.extend(
-                    [
-                        "--approved_dir",
-                        paths.promote_approved_dir,
-                        "--history_dir",
-                        paths.promote_history_dir,
-                        "--rejected_dir",
-                        paths.promote_rejected_dir,
-                        "--ledger_path",
-                        paths.promote_ledger_path,
-                    ]
+            if not _is_sha256(candidate_hash):
+                candidate_hash = approved_hash if _is_sha256(approved_hash) else candidate_hash
+
+            if mutation_selection.promote_action == "KEEP_APPROVED":
+                decision = "NOOP"
+                _log(
+                    "mutation_selection_fallback "
+                    f"candidate_hash={candidate_hash} "
+                    f"selection_reason={mutation_selection.selection_reason} "
+                    f"decision={mutation_selection.selection_decision} "
+                    f"promote_action={mutation_selection.promote_action}"
                 )
-            step3 = _run_module(
-                "meta_promote",
-                "scripts.meta_promote",
-                promote_cli,
-                logger=logger,
-                cycle_id=cycle_id,
-            )
-            if step3.return_code >= ExitCode.DATA_INVALID:
-                cycle_status = "FAIL"
-                return _finish(int(step3.return_code))
-            if step3.return_code == EXIT_ERROR:
-                cycle_status = "FAIL"
-                return _finish(EXIT_ERROR)
-
-            promote_status, promote_hash, promote_ledger_path = _parse_promotion_stage(step3)
-            if _is_sha256(promote_hash):
-                candidate_hash = promote_hash
-            if promote_ledger_path:
-                ledger_path = promote_ledger_path
-
-            if promote_status == "REJECT" or step3.return_code == EXIT_REJECT:
-                decision = "REJECTED"
-            elif promote_status == "PASS":
-                decision = "APPROVED"
-            elif promote_status == "FAIL":
-                decision = "ERROR"
-            elif step3.return_code == EXIT_OK:
-                decision = "APPROVED"
+                logger.info(
+                    event="mutation_selection_fallback",
+                    stage="meta_promote_eval",
+                    cycle_id=cycle_id,
+                    approved_hash=approved_hash,
+                    candidate_hash=candidate_hash,
+                    selection_reason=mutation_selection.selection_reason,
+                    decision=mutation_selection.selection_decision,
+                    promote_action=mutation_selection.promote_action,
+                )
             else:
-                decision = "ERROR"
+                promote_cli = [
+                    "--candidate_path",
+                    final_candidate.candidate_path,
+                    "--reason",
+                    args.reason,
+                    "--strict",
+                    str(int(args.strict)),
+                    "--csv",
+                    args.csv,
+                    "--no_exit_on_reject",
+                    "1",
+                    "--enable_scoring",
+                    str(int(args.enable_scoring)),
+                    "--w_pnl",
+                    str(float(args.w_pnl)),
+                    "--w_win",
+                    str(float(args.w_win)),
+                    "--w_dd",
+                    str(float(args.w_dd)),
+                    "--cycle_id",
+                    cycle_id,
+                    "--ledger_extra_path",
+                    mutation_selection.ledger_extra_path,
+                ]
+                if dry_run:
+                    promote_cli.extend(
+                        [
+                            "--approved_dir",
+                            paths.promote_approved_dir,
+                            "--history_dir",
+                            paths.promote_history_dir,
+                            "--rejected_dir",
+                            paths.promote_rejected_dir,
+                            "--ledger_path",
+                            paths.promote_ledger_path,
+                        ]
+                    )
+                step3 = _run_module(
+                    "meta_promote",
+                    "scripts.meta_promote",
+                    promote_cli,
+                    logger=logger,
+                    cycle_id=cycle_id,
+                )
+                if step3.return_code >= ExitCode.DATA_INVALID:
+                    cycle_status = "FAIL"
+                    return _finish(int(step3.return_code))
+                if step3.return_code == EXIT_ERROR:
+                    cycle_status = "FAIL"
+                    return _finish(EXIT_ERROR)
 
-            if decision == "ERROR":
-                cycle_status = "FAIL"
-                return _finish(EXIT_ERROR)
+                promote_status, promote_hash, promote_ledger_path = _parse_promotion_stage(step3)
+                if _is_sha256(promote_hash):
+                    candidate_hash = promote_hash
+                if promote_ledger_path:
+                    ledger_path = promote_ledger_path
 
-            if decision == "REJECTED":
-                _log("mutation_business_reject=1 -> stop_before_post_validation")
-                cycle_status = "SUCCESS_WITH_REJECT"
-                return _finish(EXIT_OK)
+                if promote_status == "REJECT" or step3.return_code == EXIT_REJECT:
+                    decision = "REJECTED"
+                elif promote_status == "PASS":
+                    decision = "APPROVED"
+                elif promote_status == "FAIL":
+                    decision = "ERROR"
+                elif step3.return_code == EXIT_OK:
+                    decision = "APPROVED"
+                else:
+                    decision = "ERROR"
+
+                if decision == "ERROR":
+                    cycle_status = "FAIL"
+                    return _finish(EXIT_ERROR)
+
+                if decision == "REJECTED":
+                    _log("mutation_business_reject=1 -> stop_before_post_validation")
+                    cycle_status = "SUCCESS_WITH_REJECT"
+                    return _finish(EXIT_OK)
         else:
             # Step 1: candidate generation
             step1 = _run_module(

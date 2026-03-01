@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -119,6 +120,87 @@ def _unlock_file(file_obj: TextIO) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if int(pid) <= 0:
+        # Unknown/invalid PID should not trigger lock break.
+        return True
+
+    psutil_module = None
+    try:
+        import psutil as psutil_module  # type: ignore
+    except Exception:
+        psutil_module = None
+
+    if psutil_module is not None:
+        try:
+            return bool(psutil_module.pid_exists(int(pid)))
+        except Exception:
+            # Fall through to platform checks below.
+            pass
+
+    if os.name == "nt":
+        # Best-effort Windows check: prefer tasklist, then fallback to PowerShell Get-Process.
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if proc.returncode == 0:
+                stdout = (proc.stdout or "").strip()
+                if stdout:
+                    lowered = stdout.lower()
+                    if "no tasks are running which match the specified criteria" in lowered:
+                        return False
+                    for line in stdout.splitlines():
+                        row = [cell.strip().strip('"') for cell in line.split(",")]
+                        if len(row) < 2:
+                            continue
+                        pid_text = "".join(ch for ch in row[1] if ch.isdigit())
+                        if pid_text and int(pid_text) == int(pid):
+                            return True
+        except Exception:
+            pass
+
+        try:
+            ps_cmd = (
+                "$p = Get-Process -Id "
+                + str(int(pid))
+                + " -ErrorAction SilentlyContinue; if ($null -eq $p) { '0' } else { '1' }"
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if proc.returncode == 0:
+                out = (proc.stdout or "").strip()
+                if out == "1":
+                    return True
+                if out == "0":
+                    return False
+        except Exception:
+            pass
+
+        # Safety: if liveness cannot be determined, assume alive to avoid breaking valid locks.
+        return True
+
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        # Safety: if liveness cannot be determined, assume alive to avoid breaking valid locks.
+        return True
 
 
 @dataclass
@@ -241,6 +323,16 @@ def acquire_exclusive_lock(
         existing_payload = _read_payload(lock_path)
         existing_owner = _owner_from_payload(existing_payload, fallback_epoch=now_epoch)
         age_s = max(0.0, now_epoch - float(existing_owner.start_epoch))
+
+        if int(existing_owner.pid) > 0 and not _pid_is_alive(int(existing_owner.pid)):
+            # Dead owner PID means the writer crashed/exited; treat lock file as stale immediately.
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            continue
 
         if int(existing_owner.active) == 0:
             try:
